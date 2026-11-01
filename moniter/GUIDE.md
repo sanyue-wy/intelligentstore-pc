@@ -38,4 +38,4 @@ get_message_bus().publish(TOPIC_MONITOR_HEARTBEAT,
 实现 `MonitorServiceBase`（可复用 `HealthWatchdogBase` / `AlertManagerBase`）并 `register_monitor_backend()`。
 
 ## 6. 调试
-`python main.py --monitor`：心跳、资源、告警看板。
+`./is.sh web` 后浏览器打开 `:8090` 的「完整调试」页：心跳、资源、告警看板。

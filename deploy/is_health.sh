@@ -119,17 +119,11 @@ else
     add warn "远程服务 :$PORT 无响应" "调试界面镜像不可用 (systemctl restart x5_remote)"
 fi
 
-# ---- 6. 调试工作台（可选） ----
-dbg_units=$(systemctl list-units --plain --no-legend 'intelligentstoring-debug@*' 2>/dev/null | awk '$4=="running"{print $1}')
-if [ -n "$dbg_units" ]; then
-    n=$(DISPLAY=:99 xdotool search --onlyvisible --name '.' 2>/dev/null | wc -l)
-    if [ "$n" -gt 0 ]; then
-        add ok "调试工作台运行中" "$(echo $dbg_units | tr '\n' ' ') 窗口 $n 个"
-    else
-        add warn "调试工作台无窗口" "$dbg_units 运行中但 :99 上没有可见窗口"
-    fi
+# ---- 6. 网页调试台（可选, 前台进程） ----
+if docker exec "$CONTAINER" pgrep -af "[v]ision_tool.py web" >/dev/null 2>&1; then
+    add ok "网页调试台运行中" ":8090 (浏览器访问)"
 else
-    [ "$MODE" = "--quiet" ] || add ok "调试工作台" "未运行（按设计不自启）"
+    [ "$MODE" = "--quiet" ] || add ok "网页调试台" "未运行（./is.sh web 启动）"
 fi
 
 # ---- 7. 资源余量 ----

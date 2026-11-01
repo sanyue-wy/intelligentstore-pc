@@ -9,7 +9,7 @@
 | 监控 | `moniter/interfaces.py` | `moniter/GUIDE.md` | 心跳看门狗、资源、告警（含 race 告警） |
 | 工具 | 命令行 | `tools/GUIDE.md` | `./convert.sh`、`vision_tool.py web`、`calib_intrinsics.py`、`train.py` |
 | 部署 | `deploy/*.sh`、`*.service` | `deploy/OPERATIONS.md` | ubuntu:22.04 容器 + 宿主 BPU 挂载；比赛模式 service |
-| 调试界面 | 依赖以上接口 | `debug/README.md` | Tk 工作台；视觉调参转浏览器 |
+| 调试界面 | 依赖以上接口 | `WEB_CONSOLE.md` | 统一网页调试台 :8090 (视觉/流程/通讯/完整) + 比赛执行页 :8088 |
 
 总指导见 `README.md`。
 
@@ -50,5 +50,24 @@
 - 比赛执行页 `UI/run_page.py`（:8088）接入共享样式与红橙「比赛模式」顶栏，新增 `/screen`（全屏只读）
   与 `/static/<name>`；`开始/停止本轮/急停/一键重启/刷新自检` 与 `state_dict`/`frame_jpeg`/`screen_png`/`request`
   逻辑**未改**。详见 `WEB_CONSOLE.md`。
-- `debug/` 下 Tk 调试器仍未删除（阶段 3 处理）；`communication/`、`UI/run_competition.py` 状态机
+- `debug/` 下 Tk 调试器已在阶段 3 删除；`communication/`、`UI/run_competition.py` 状态机
   与看门狗行为**未改**。
+
+
+## 重构记录（阶段 3：删除旧的/无用的）
+
+- 删除补丁备份目录 `patch_backup_tray_fixed_1101_144419/`、`patch_backup_vision1102_1101_154036/`。
+- 删除整套 Tk 桌面调试器：`debug/` 整目录（含 `*_debug/`、`common/`、`*.bat`）与 `main.py`（Tk 启动入口）。
+  调试入口现由 `./is.sh web` → `tools/vision_tool.py web` 统一提供。
+- 删除 Tk 相关部署：`deploy/is_debug.sh`、`deploy/intelligentstoring-debug@.service`；同步更新
+  `is.sh`（`start`=`web`、`stop/status` 改为 `run_competition|vision_tool`、`race on` 先停调试台）、
+  `deploy/intelligentstoring.service` / `-competition.service` 注释与 Conflicts、`deploy/OPERATIONS.md`。
+- 删除 `UI/display_ui.py` 的本地 Tk 兜底窗口（`_init_local_window/_refresh_local/_render_local/...`）；
+  仅保留远程大屏推送主链路，网页大屏由 `/screen` 提供只读预览。
+- `tools/calib_images/`（60 张货物照片，非棋盘格）移到 `dataset/calib_images_20261029/`（`.gitignore` 内），
+  不再进仓库。
+- 保留 `vision/models/best_1027_640x480.bin` + 同名 `.json`（类别名）、`best_1027.pt`（转换源）。
+  `best_1027_640x480.onnx`（12MB，ONNX 回退）**未删**，按规格"删除模型文件先问用户"，待用户确认。
+- **未删死代码误报**：`communication/client.py` 的 `_waiting_ack_seq / _ack_event` 经核查**仍在用**
+  （`_wait_and_ack` 与 `_handle_status` 中真实读写），不是死代码，故保留、不改逻辑。
+- 文档同步：`README.md`、`MODULES.md`、各 `GUIDE.md`、`deploy/OPERATIONS.md` 去除指向已删文件的段落。

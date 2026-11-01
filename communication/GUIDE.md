@@ -57,7 +57,7 @@ PERMIT      ──▶ 下潜夹取 ─▶ 运送 ─▶ 放置 ─▶ 归位 ─
 **注意**：比赛流程额外依赖 `send_storage_slot / send_tray_shake / send_tray_home / execute_sorting_task_ex`（见 `UI/interfaces.py` 的 `SortingClientLike`），替换时必须一并提供。
 
 ## 6. 调试
-`python main.py --comm`：串口、JOG、夹爪、32B Hex 报文监视。
+`./is.sh web` 后浏览器打开 `:8090` 的「通讯调试」页：串口发现/连接/模拟、JOG、夹爪、32B Hex 报文监视。
 
 ## 7. 环境变量
 | 变量 | 说明 |

@@ -10,12 +10,11 @@
 | --- | --- |
 | 看整体健康状态 | `is_health.sh` |
 | 比赛模式（只开物理屏大屏） | `systemctl start x5_bigscreen` |
-| 开调试工作台 | `is_debug.sh on` |
-| 开指定调试器 | `is_debug.sh on --comm`（`--vision` / `--msg` / `--monitor`） |
-| 关调试工作台 | `is_debug.sh off` |
-| 看调试界面 | 浏览器打开 `http://<X5-IP>:8756/ui` |
+| 开网页调试台 | `./is.sh web --arm`（浏览器打开 `http://<X5-IP>:8090`） |
+| 关网页调试台 | `./is.sh stop` |
+| 看调试界面 | 浏览器打开 `http://<X5-IP>:8090`（调试台）或 `:8088`（比赛执行页） |
 | 容器丢了 / 依赖没了 | `provision_intelligentstoring.sh` |
-| 看日志 | `is_debug.sh log` 或 `journalctl -u intelligentstoring -f` |
+| 看日志 | `./is.sh log` 或 `journalctl -u intelligentstoring -f` |
 | 全屏黑屏 / 自动黑屏 | `is_boot_guard.sh`（重新锁 framebuffer + 关 DPMS） |
 | **比赛程序（待机→启动键）** | `./start_competition.sh`；开机自启 `./is.sh race on` / 关 `./is.sh race off` |
 | **执行页** | 浏览器打开 `http://<X5-IP>:8088` |
@@ -64,13 +63,12 @@ sudo ./is.sh migrate                      # = bpu_bridge.sh 生成挂载参数 +
 | 单元 | 开机自启 | 作用 | 出问题时的现象 |
 | --- | --- | --- | --- |
 | `x5_bigscreen.service` | ✅ enabled | **比赛大屏**：物理屏 `:0` 上显示「智能分拣 · 分拣信息」成功页 | 物理屏黑/无窗口 |
-| `x5_remote.service` | ✅ enabled | 远程服务 `:8756`，同时负责启动虚拟屏 `Xvfb :99`（1280x820） | 浏览器打不开 / 调试器起不来 |
+| `x5_remote.service` | ✅ enabled | 远程服务 `:8756`（大屏 HTTP 推送），同时启动虚拟屏 `Xvfb :99` | 大屏推送失败 |
 | `intelligentstoring.service` | ✅ enabled | **容器保活 + 依赖自愈**：等 docker 和 `:0` 就绪，容器没了就重建，依赖缺了就装 | 容器不存在 / `import cv2` 失败 |
-| `intelligentstoring-debug@.service` | ❌ **不自启（设计如此）** | **调试工作台**：手动启动、崩溃 5 秒自动重拉 | — |
 | `logrotate.timer` | ✅ enabled | 每天轮转 `/var/log/intelligentstoring/*.log`（单个超 5 MB 也轮转） | 磁盘被日志写满 |
 
-**关键设计：物理屏只显示比赛大屏。** 调试界面一律跑在虚拟屏 `:99`，通过浏览器看，所以
-「比赛大屏还在跑」和「我在调试」可以同时成立，不需要停大屏。
+**关键设计：物理屏只显示比赛大屏。** 调试界面是网页版（`./is.sh web` → `:8090`），
+在笔记本浏览器里操作，所以「比赛大屏还在跑」和「我在调试」可以同时成立，不需要停大屏。
 
 ---
 
@@ -84,42 +82,28 @@ is_health.sh
 systemctl start x5_bigscreen
 is_health.sh          # 等到「比赛大屏 ✓ … 物理屏窗口 id=…」
 
-# 3) 确保调试工作台是关的（比赛时不该有调试窗口占 CPU）
-is_debug.sh off
+# 3) 确保网页调试台是关的（比赛时不该有调试进程占 CPU）
+./is.sh stop
 ```
 
-比赛期间**不要**执行 `is_debug.sh on`（会额外吃 CPU/内存）；确实要临时排查，
-用完立刻 `is_debug.sh off`。
+比赛期间**不要**开着调试台（会额外吃 CPU/内存）；确实要临时排查，
+用完立刻 `./is.sh stop`。
 
 ---
 
 ## 3. 调试时怎么用
 
 ```bash
-is_debug.sh on                 # 综合工作台（默认）
-is_debug.sh on --comm          # 通讯调试器
-is_debug.sh on --vision        # 视觉调参 -> 实际转到浏览器调试台 :8090 (见第 10 节)
-is_debug.sh on --msg           # 消息中心
-is_debug.sh on --monitor       # 监控看板
-
-is_debug.sh status             # 看哪个实例在跑、:99 上有哪些窗口、访问地址
-is_debug.sh log                # 跟随日志（Ctrl-C 退出）
-is_debug.sh off                # 全部关闭
+./is.sh web --arm      # 统一调试台: 8090 (视觉/流程/通讯/完整); --arm 连下位机
+./is.sh stop           # 关闭调试台 (结束 vision_tool 进程)
+./is.sh status         # 看容器与调试/比赛进程
+./is.sh log            # 跟随日志 (Ctrl-C 退出)
 ```
 
-然后在**笔记本浏览器**打开 `http://<X5-IP>:8756/ui`（`is_debug.sh open` 会直接打印地址）。
+然后在**笔记本浏览器**打开 `http://<X5-IP>:8090`（统一调试台，顶部导航切换
+视觉/流程/通讯/完整 四节；大屏只读预览 `/screen`）。比赛执行页在 `:8088`。
 
-**崩溃自愈**：程序异常退出（段错误、`kill -9`、Tk 报错）后，systemd 会在 5 秒内自动
-重新拉起，不需要人工干预。连续崩溃时会指数退避（最长约 60 秒一次），不会把 CPU 打满。
-
-> 想验证自愈：
-> ```bash
-> is_debug.sh on
-> docker exec intelligentstoring pkill -9 -f '[m]ain\.py'
-> sleep 12
-> systemctl show -p NRestarts -p ActiveState intelligentstoring-debug@workbench.service
-> ```
-> `NRestarts` 会 +1，`ActiveState` 回到 `active`。
+调试台是前台进程，异常退出不会自动拉起，重新执行 `./is.sh web` 即可。
 
 ---
 
@@ -156,7 +140,7 @@ provision_intelligentstoring.sh --check-only   # 全过 exit 0，缺东西 exit 
 | 位置 | 内容 |
 | --- | --- |
 | `journalctl -u intelligentstoring` | 容器保活/依赖补齐的每一步 |
-| `journalctl -u 'intelligentstoring-debug@*'` | 调试工作台的标准输出与退出码 |
+| `docker logs intelligentstoring` / `journalctl -u intelligentstoring -f` | 调试台/比赛进程输出 |
 | `/var/log/intelligentstoring/` | 程序自己的日志（**已挂载进容器**，容器删了日志还在） |
 
 轮转策略 `/etc/logrotate.d/intelligentstoring`：
@@ -187,7 +171,7 @@ logrotate -vf /etc/logrotate.d/intelligentstoring
 | 显示 | 分辨率 | 谁在用 |
 | --- | --- | --- |
 | `:0`（HDMI-1） | 800x480 原生 | 比赛大屏 `x5_bigscreen` |
-| `:99`（Xvfb） | 1280x820 | 调试工作台（浏览器经 `:8756/ui` 查看） |
+| `:99`（Xvfb） | 1280x820 | 大屏/远程服务内部使用（调试已改网页 `:8090`） |
 
 虚拟分辨率 1280x820 的持久化由 `x5_remote.service` 负责（它启动 Xvfb 时直接带这个尺寸），
 不依赖临时的 `xrandr --fb` 命令，**重启后不会丢**。
@@ -211,12 +195,11 @@ systemctl restart x5_bigscreen
 is_health.sh                      # 确认「物理屏窗口 id=…」出现
 ```
 
-### 7.2 调试工作台起不来
+### 7.2 网页调试台起不来
 ```bash
-is_debug.sh status
-systemctl status 'intelligentstoring-debug@*' --no-pager -l
-journalctl -u 'intelligentstoring-debug@*' -n 50 --no-pager
-# 常见原因：容器没跑（is_health.sh 看）、:99 没起来（systemctl start x5_remote）
+./is.sh status                 # 容器是否在跑
+docker exec -it intelligentstoring bash -lc 'cd /app && python3 tools/vision_tool.py web --camera synthetic --no-auth --port 18090'
+# 常见原因：容器没跑（is_health.sh 看）、端口被旧进程占用（./is.sh stop 后重开）
 ```
 
 ### 7.3 容器里 `import cv2` / `import serial` 报错
@@ -368,11 +351,9 @@ systemctl daemon-reload
 ```
 /usr/local/sbin/provision_intelligentstoring.sh   幂等容器创建 + 依赖补齐
 /usr/local/sbin/is_boot_guard.sh                  开机就绪等待 + 屏幕锁定
-/usr/local/sbin/is_debug.sh                       调试工作台启停
 /usr/local/sbin/is_health.sh                      10 项健康检查（--json / --quiet）
 
 /etc/systemd/system/intelligentstoring.service
-/etc/systemd/system/intelligentstoring-debug@.service
 /etc/logrotate.d/intelligentstoring
 
 /var/log/intelligentstoring/                      日志目录（挂载进容器）

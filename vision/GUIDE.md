@@ -5,7 +5,7 @@
 
 ## 1. 边界
 
-对外接口不变（UI/、debug/、MessegeCenter 不用改）：`create_vision_service(bus, backend, **kw)`、`VisionServiceBase` 全部方法、`scan()`、`get_fresh_frames()`、`detector.color_ranges / get_color_mask / update_color_range`、`VisionTarget` 字段、心跳 `module_name="vision"` 1Hz、`TOPIC_VISION_TARGET`、`from vision.camera import PhysicalCamera, SyntheticCamera`。
+对外接口不变（UI/、MessegeCenter 不用改）：`create_vision_service(bus, backend, **kw)`、`VisionServiceBase` 全部方法、`scan()`、`get_fresh_frames()`、`detector.color_ranges / get_color_mask / update_color_range`、`VisionTarget` 字段、心跳 `module_name="vision"` 1Hz、`TOPIC_VISION_TARGET`、相机实现 `from vision.cameras import SyntheticCamera` / `from vision.cameras.uvc import PhysicalCamera`。
 
 ## 2. 结构
 ```

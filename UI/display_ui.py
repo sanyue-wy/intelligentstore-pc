@@ -102,9 +102,8 @@ def render_screen(seq, name, total, image_path: str = "", stage: str = "分拣�
 class CompetitionUI(ScreenBase):
     """分拣成功页控制器。
 
-    同时驱动两条显示链路:
-      * 远程/物理大屏（通过 X5 大屏服务，主链路）
-      * 本地 Tk 窗口（兜底，仅当大屏服务不可用时才真正建窗）
+    主链路：远程/物理大屏（通过 X5 大屏服务，:8756）。
+    本地 Tk 兜底窗口已在阶段 2 移除，改由网页大屏 /screen 提供只读预览。
     """
 
     SCREEN_W = 800
@@ -117,20 +116,13 @@ class CompetitionUI(ScreenBase):
         self._name = "--"
         self._stage = "待机"
         self._image_path = ""
-        self._root = None
-        self._lbl = None
-        self._tkimg = None
         self._closed = False
 
-        # 主链路：远程大屏
+        # 主链路：远程大屏 (物理屏由 x5_bigscreen / 网页 /screen 承载)
         self.client = ScreenClient(
             endpoint or os.environ.get("X5_SCREEN_ENDPOINT",
                                        "http://127.0.0.1:8756/api/screen"))
-
-        # 兜底链路：本地窗口（物理屏）
-        self._local_ready = False
-        if force_local:
-            self._init_local_window(fullscreen)
+        # force_local/fullscreen 参数保留以兼容旧调用；本地 Tk 兜底已移除
 
     # ------------------------------------------------------------------
     # 对外接口（与原有调用方式完全兼容）
@@ -151,10 +143,6 @@ class CompetitionUI(ScreenBase):
                              image_path=self._image_path, stage=stage)
         except Exception:
             pass
-
-        # 兜底：仅当本地窗口已建立
-        if self._local_ready:
-            self._refresh_local()
 
     def flush(self, timeout: float = 1.0) -> bool:
         """等大屏推送完成 (赛规: 显示完本件信息后才分拣下一件)。"""
@@ -199,94 +187,13 @@ class CompetitionUI(ScreenBase):
             self.client.close()
         except Exception:
             pass
-        if self._root is not None:
-            try:
-                self._root.after(0, self._root.destroy)
-            except Exception:
-                pass
-
-    # ------------------------------------------------------------------
-    # 本地兜底窗口（800x480，纯显示，无控件）
-    # ------------------------------------------------------------------
-    def _init_local_window(self, fullscreen: bool) -> None:
-        try:
-            import tkinter as tk
-            from PIL import Image, ImageDraw, ImageFont, ImageTk
-        except ImportError:
-            print("[大屏] 本地窗口不可用（缺 tkinter/PIL），仅使用远程大屏")
-            return
-
-        try:
-            self._root = tk.Tk()
-        except Exception as exc:
-            print(f"[大屏] 无法创建本地窗口: {exc}")
-            return
-
-        self._tk = tk
-        self._PIL = (Image, ImageDraw, ImageFont, ImageTk)
-        root = self._root
-        root.title("智能分拣 · 分拣信息")
-        root.geometry(f"{self.SCREEN_W}x{self.SCREEN_H}+0+0")
-        root.configure(bg="#0c1018")
-        if fullscreen:
-            try:
-                root.attributes("-fullscreen", True)
-            except Exception:
-                pass
-        try:
-            root.attributes("-topmost", True)
-            root.configure(cursor="none")
-        except Exception:
-            pass
-
-        self._lbl = tk.Label(root, bg="#0c1018", bd=0, highlightthickness=0)
-        self._lbl.pack(fill="both", expand=True)
-        root.protocol("WM_DELETE_WINDOW", self._on_window_close)
-        self._local_ready = True
-        root.update()
-        self._refresh_local()
-
-    def _on_window_close(self) -> None:
-        self._local_ready = False
-        try:
-            self._root.destroy()
-        except Exception:
-            pass
-        self._root = None
-
-    def _render_local(self):
-        """生成 800x480 的分拣成功页。"""
-        return render_screen(self._seq, self._name, self._total, self._image_path, self._stage,
-                             self.SCREEN_W, self.SCREEN_H)
-
-    def _refresh_local(self) -> None:
-        if not self._local_ready:
-            return
-        try:
-            _, _, _, ImageTk = self._PIL
-            img = self._render_local()
-            self._tkimg = ImageTk.PhotoImage(img)
-            self._lbl.configure(image=self._tkimg)
-            self._root.update_idletasks()
-            self._root.update()
-        except Exception:
-            pass
 
     # ------------------------------------------------------------------
     # 比赛现场用：让大屏定格的等待
     # ------------------------------------------------------------------
     def hold(self, seconds: float = 5.0) -> None:
         """保持大屏显示 seconds 秒（供评委查看），不阻塞主线程以外的东西。"""
-        if self._local_ready and self._root is not None:
-            end = time.time() + seconds
-            while time.time() < end:
-                try:
-                    self._root.update()
-                except Exception:
-                    break
-                time.sleep(0.03)
-        else:
-            time.sleep(seconds)
+        time.sleep(seconds)
 
 
 if __name__ == "__main__":

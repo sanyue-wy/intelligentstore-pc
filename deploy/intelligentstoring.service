@@ -8,10 +8,10 @@
 #   3. 依赖（tkinter / pyserial / opencv / 字体 / X 工具）缺失时自动补齐
 #   4. 补齐失败（如断网开机）→ 服务判失败，Restart=on-failure 定期重试
 #
-# 为什么不在这里启动 main.py：
-#   * 物理屏 :0 上已经由 x5_bigscreen.service 显示比赛大屏（赛项规定装置屏
-#     只显示分拣成功页）；调试界面在虚拟屏 :99 上运行、经 8756 /ui 远程查看。
-#   * 调试工作台做到「手动启动 + 崩溃自愈」即可 → intelligentstoring-debug@.service
+# 为什么不在这里启动调试界面：
+#   * 物理屏 :0 上由 x5_bigscreen.service 显示比赛大屏（赛项规定装置屏只显示
+#     分拣成功页）；调试台是网页版，由 ./is.sh web 前台启动、浏览器 :8090 访问。
+#   * 比赛模式由 intelligentstoring-competition.service 单独管理。
 #
 # 设计要点（针对本机环境）：
 #   * Type=oneshot + RemainAfterExit=yes：主进程是短命的准备脚本，退出码 0

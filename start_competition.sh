@@ -19,9 +19,7 @@ CONTAINER=${CONTAINER:-intelligentstoring}
 if [ ! -f /.dockerenv ] && command -v docker >/dev/null 2>&1 \
    && [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = "true" ]; then
     # 宿主: 停调试工作台, 然后进容器跑本脚本
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl stop 'intelligentstoring-debug@*' >/dev/null 2>&1 || true
-    fi
+    # 网页调试台由容器内的 pkill 关闭 (见下方「比赛模式」段)
     TTY=""; [ -t 0 ] && TTY="-it"
     ENVS=()
     for v in $(env | grep -E '^(EXPECTED_TOTAL|START_|STM_PORT|ALLOW_MOCK|USE_SYNTHETIC_CAM|SCAN_FRAMES|IS_|COMMIT_CONF|PREFETCH_STAGE|IDLE_GUARD_S|ONESHOT|SORT_TIMEOUT_S|MAX_)' | cut -d= -f1); do

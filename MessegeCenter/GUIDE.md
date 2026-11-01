@@ -67,4 +67,4 @@ led.snapshot().to_dict()      # {"state","total_done","attempts","failures","slo
 ## 6. 约定
 - 数据类只在 `topics.py` 定义，别处 re-export（router 用 `isinstance` 判断）；
 - 替换为 ZeroMQ/MQTT：实现 `MessageBusBase` 并 `register_message_bus_backend()`；
-- 调试：`python main.py --msg` 监听全部主题（含 `race/*`）并可注入事件。
+- 调试：`./is.sh web` 后浏览器打开 `:8090` 的「完整调试」页，可查看总线事件（含 `race/*`）。

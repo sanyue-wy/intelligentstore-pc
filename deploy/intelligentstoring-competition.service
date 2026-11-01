@@ -2,14 +2,13 @@
 # ============================================================================
 # 比赛模式开机自启: 上电 -> 自检 -> 待机, 裁判下令后按装置上的启动键开始。
 #   开启: ./is.sh race on      关闭: ./is.sh race off
-# 与调试工作台 (intelligentstoring-debug@) 互斥: 两者都要相机和串口。
+# 调试台为网页前台进程 (./is.sh web)，比赛启动脚本/ `is.sh race on` 会先关闭它。
 # 安装: cp deploy/intelligentstoring-competition.service /etc/systemd/system/ && systemctl daemon-reload
 #       并把下面的 WorkingDirectory/ExecStart 路径改成板上工程目录
 # ============================================================================
 Description=STM32 智能分拣 - 比赛模式 (待机等一键启动, 执行页 :8088)
 After=docker.service intelligentstoring.service x5_bigscreen.service
 Requires=docker.service intelligentstoring.service
-Conflicts=intelligentstoring-debug@workbench.service intelligentstoring-debug@vision.service intelligentstoring-debug@comm.service
 StartLimitIntervalSec=0
 
 [Service]

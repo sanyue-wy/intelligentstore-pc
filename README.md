@@ -47,7 +47,7 @@ cp best.pt vision/models/ && ./convert.sh  # 5. 换模型: 一条命令 .pt -> O
           │ 总线 + RaceLedger 赛规复核            │──告警────▶│ moniter/ 监控 │
           └─────────────────────────────────────┘           └──────────────┘
    tools/ : 一键模型转换、浏览器调参台、内参标定、训练      deploy/ : 容器、BPU 挂载、systemd、运维
-   debug/ : Tk 调试工作台 (通讯/消息/监控; 视觉调参转浏览器)
+   webui/ : 统一网页调试台 :8090 (视觉/流程/通讯/完整) ; 比赛执行页 :8088
 ```
 
 | 模块 | 读这个 | 一句话 |
@@ -82,7 +82,7 @@ cp best.pt vision/models/ && ./convert.sh  # 5. 换模型: 一条命令 .pt -> O
 ## 6. 目录
 
 ```
-convert.sh  is.sh  start_competition.sh  main.py  Dockerfile
+convert.sh  is.sh  start_competition.sh  Dockerfile
 vision/         视觉: service / yolo_engine / yolo_detector / calibration / tray / color_calib / cameras/
                 配置: vision_config.json  classes.json  calib_config.json(现场生成, 例子 calib_config.example.json)  models/
 UI/             比赛流程: run_competition / planner / controller / display_ui / start_trigger / run_page / run_report / precheck
@@ -90,9 +90,9 @@ communication/  下位机通讯
 MessegeCenter/  信息处理中心: bus / topics / race / router
 moniter/        监控
 tools/          convert_model / vision_tool / calib_intrinsics / train
-deploy/         provision / bpu_bridge / bpu_doctor / is_debug / is_health / systemd / OPERATIONS.md
+deploy/         provision / bpu_bridge / bpu_doctor / is_health / systemd / OPERATIONS.md
 requirements.txt / requirements-export.txt   依赖版本 (与 Dockerfile、provision 一致; 脱离容器部署时用)
-debug/          Tk 调试工作台
+webui/          统一网页调试台 (debug_console + 比赛页 + 共享静态资源)
 records/        运行时生成: scans/(每次扫描) runs/(每轮报告)
 ```
 
