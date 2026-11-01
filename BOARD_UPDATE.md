@@ -28,12 +28,8 @@ cd "/root/Desktop/1/pc_test_stm - 2/pc_test_stm"
 git status            # 确认干净；若有本地改动先 git stash
 git fetch origin
 
-# 情况1：分支已合并到 main
 git checkout main && git pull --ff-only
-
-# 情况2：尚未合并，直接用重构分支
-git checkout refactor/phase3-cleanup
-git log --oneline -5   # 应看到 eaf7168 阶段3 / 9a4fc9b 阶段2 ...
+git log --oneline -12   # 可见阶段0→阶段1→阶段2→阶段3 的连续提交
 ```
 
 ## C. 校验（不启动业务，只查语法与单测）

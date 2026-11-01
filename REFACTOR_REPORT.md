@@ -12,12 +12,12 @@
 
 | 阶段 | 分支 | commit | 内容 |
 |---|---|---|---|
-| 阶段0 | `refactor/phase0-coordinates` | bae6c2e, 1d28cf0, c28cb67, 48aad72, c50f4bc, d7e007b | 修坐标自检、平面位姿取低倾角、标定配置按现场更新、文档同步 |
-| 阶段1 | `refactor/phase1-flatten` | 2fa1ed7 | 去除无意义嵌套（删空转发/重复入口/示例） |
-| 阶段2 | `refactor/phase2-web` | 9a4fc9b | 统一网页调试台(8090 四节) + 比赛页(8088) + 共享样式 |
-| 阶段3 | `refactor/phase3-cleanup` | eaf7168 | 删旧（Tk 调试器/备份目录/货物照），部署与文档同步 |
+| 阶段0 | `main` | bae6c2e, 1d28cf0, c28cb67, 48aad72, c50f4bc, d7e007b | 修坐标自检、平面位姿取低倾角、标定配置按现场更新、文档同步 |
+| 阶段1 | `main` | 2fa1ed7 | 去除无意义嵌套（删空转发/重复入口/示例） |
+| 阶段2 | `main` | 9a4fc9b | 统一网页调试台(8090 四节) + 比赛页(8088) + 共享样式 |
+| 阶段3 | `main` | eaf7168 | 删旧（Tk 调试器/备份目录/货物照），部署与文档同步 |
 
-> 三个分支可用 `git log --oneline` 依次查看；`refactor/phase3-cleanup` 包含前序全部提交。
+> 全部阶段提交都在 `main` 上、线性顺序，`git log --oneline` 即可逐条查看；没有额外的重构分支。
 
 ## 2. 阶段 0：修自检的坐标问题
 
@@ -104,7 +104,7 @@ pc_test_stm/
 └── MessegeCenter/  moniter/  README.md MODULES.md …
 ```
 
-**重构后（refactor/phase3-cleanup）**
+**重构后（main）**
 ```
 pc_test_stm/
 ├── webui/                      # 新增：统一网页包 (base/pages/comm_debug/flow_debug/screen/static/test_webui)
