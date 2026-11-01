@@ -7,7 +7,7 @@ import time
 import numpy as np
 from MessegeCenter import MessageBus
 from vision.calibration import CoordinateCalibrator
-from vision.camera import SyntheticCamera
+from vision.cameras import SyntheticCamera
 from vision.detector import WorkpieceDetector
 from vision.service import VisionService
 

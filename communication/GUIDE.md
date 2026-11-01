@@ -11,7 +11,7 @@
 | `client.py` | `IntelligentSortingClient`：连接、收包线程、ACK、指令、任务执行器 |
 | `serial_discovery.py` | 串口自动发现：显式参数 > `STM_PORT` > 扫描 `/dev/ttyACM*`、`/dev/ttyUSB*` |
 | `mock_device.py` | `MockSTM32` 仿真下位机（行为与固件任务流程一致） |
-| `test_comm.py` / `example_usage.py` | 单元测试 / 示例 |
+| `test_comm.py` | 单元测试 |
 
 ## 2. 快速使用
 ```python

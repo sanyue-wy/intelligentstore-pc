@@ -35,7 +35,8 @@ from .config import VisionConfig, load_vision_config
 from .calibration import CoordinateCalibrator
 from .cameras import (FrameGrabber, ReplayCamera, create_camera, list_cameras,
                       register_camera)
-from .camera import BaseCamera, PhysicalCamera, SyntheticCamera
+from .cameras import SyntheticCamera
+from .cameras.uvc import BaseCamera, PhysicalCamera
 from .detector import (
     WorkpieceDetector,
     VISION_SCALE_ENV,
