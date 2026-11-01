@@ -37,6 +37,10 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+# RDK X5 容器的 OpenCL 上下文不可用, 畸变页「一键校正」走 undistortPoints 会无限挂起
+# (见 vision/__init__.py)。必须在 import cv2 前关掉。
+os.environ.setdefault("OPENCV_OPENCL_RUNTIME", "disabled")
+
 import cv2
 import numpy as np
 
@@ -245,7 +249,7 @@ HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>视觉调试�
 button{margin:2px;padding:6px 10px;background:#335;color:#fff;border:0;border-radius:4px;cursor:pointer}
 button.on{background:#a60}table{border-collapse:collapse}td,th{border:1px solid #444;padding:2px 5px}
 pre{white-space:pre-wrap;background:#111;padding:6px;max-height:200px;overflow:auto}.bad{color:#f66}.ok{color:#3d8}.hint{color:#fa4}
-.tabs button{background:#223}.tabs button.on{background:#a60}.pane{display:none}.pane.on{display:block}
+.tabs button{background:#223}.tabs button.on{background:#a60}.pane{display:none}.pane.on{display:block}.dim{opacity:.6}
 input[type=range]{width:220px}#msg{color:#fb3;min-height:18px}.thumb{width:160px;cursor:pointer}</style></head>
 <body><div id="l"><img id="v" src="/stream"><br>
 <button onclick="scan()">Scan (比赛同款)</button><button onclick="snap()">Snap 存原图</button>
@@ -256,7 +260,9 @@ input[type=range]{width:220px}#msg{color:#fb3;min-height:18px}.thumb{width:160px
 <button onclick="tab('cam')" id="t_cam">相机</button><button onclick="tab('col')" id="t_col">颜色</button>
 <button onclick="tab('scr')" id="t_scr">大屏</button><button onclick="tab('run')" id="t_run">复盘</button></div>
 <div class="pane on" id="p_st"><pre id="st"></pre>
- <b>点击画面</b>: 显示像素对应的机械臂坐标。<span id="gotobox"><br><label><input type="checkbox" id="goto"> 点哪去哪: 机械臂开到点击位置上方停住 (不夹取), 用来验标定</label></span></div>
+ <b>点击画面</b>: 显示像素对应的机械臂坐标。<span id="gotobox"><br><label><input type="checkbox" id="goto"> 点哪去哪: 机械臂开到点击位置上方停住 (不夹取), 用来验标定</label>
+ 抓取高 <input type="number" id="gh" value="0" min="0" max="150" step="1" style="width:52px"> mm
+ <span class="dim">(0 = 按托盘底面算; 点货物顶面时填实际抓取高度, 例如 30mm 货 × 0.6 = 18, 用来验高度投影)</span></span></div>
 <div class="pane" id="p_cal"><button id="bc" onclick="mode('calib')">标定模式</button><button id="br" onclick="mode('roi')">ROI 模式</button><span id="extra"></span>
  <p>标定: 托盘内均匀放 9 个标记, 逐个点击并输入机械臂坐标 (--arm 时自动读取当前位置)。ROI: 依次点击托盘轮廓。</p><b>标定点</b><div id="cp"></div></div>
 <div class="pane" id="p_tray"><p>托盘坐标系: 原点 = 画面左上方的内框角, +x 沿画面向右, +y 沿画面向下。画面里绿框 = 检测到的白色外边界 (红 = 本帧没检测到), 青框 = 推算的内框, 红/绿箭头 = 托盘 +x/+y, 紫叉 = 参考点。</p>
@@ -339,10 +345,11 @@ $('v').onclick=async e=>{let r=$('v').getBoundingClientRect();let k=$('v').natur
   if(FX.length==4){let d=await post('/api/tray/fixed',{corners:FX,snap:$('fx_snap').checked,z:$('fx_z').value});mode('corners');
    $('msg').innerText=d.ok?('已固定托盘四角 '+(d.snap||'')+' '+((d.status.perspective||{}).msg||'')):'失败: '+d.error;$('trst').innerText=JSON.stringify(d,null,1);trget()}return}
  if(M=='roi'){roi.push([u,v]);$('msg').innerText='ROI 点: '+JSON.stringify(roi);return}
- let d=await J('/api/pixel?u='+u+'&v='+v);let hsv=await J('/api/hsv?u='+u+'&v='+v);
- $('msg').innerText=`像素(${u},${v}) -> 机械臂(${d.x_mm}, ${d.y_mm}) mm   HSV=(${hsv.h},${hsv.s},${hsv.v})`;
+ let hh=+($('gh').value||0);
+ let d=await J('/api/pixel?u='+u+'&v='+v+'&h='+hh);let hsv=await J('/api/hsv?u='+u+'&v='+v);
+ $('msg').innerText=`像素(${u},${v})${hh>0?` @高${hh}mm`:''} -> 机械臂(${d.x_mm}, ${d.y_mm}) mm   HSV=(${hsv.h},${hsv.s},${hsv.v})`;
  if($('goto').checked){if(!confirm(`机械臂开到 (${d.x_mm}, ${d.y_mm}) 上方? 确认周围无障碍`))return;$('msg').innerText+='  移动中...';
-  let g=await post('/api/goto',{u,v});$('msg').innerText=g.ok?`到位: 目标(${g.target}) 实际(${g.reached}) 偏差 ${g.err_mm} mm — 看夹爪是否正对货物中心`:'失败: '+g.error}}
+  let g=await post('/api/goto',{u,v,h:hh});$('msg').innerText=g.ok?`到位: 目标(${g.target}) 实际(${g.reached}) 偏差 ${g.err_mm} mm — 看夹爪是否正对货物中心`:'失败: '+g.error}}
 async function scan(){$('msg').innerText='扫描中...';let d=await post('/api/scan');
  $('msg').innerText=JSON.stringify(d.stat);let h='<table><tr><th>#</th><th>名称</th><th>类别</th><th>颜色</th><th>置信</th><th>像素</th><th>mm</th><th>帧</th></tr>';
  for(let t of d.targets)h+=`<tr><td>${t.id}</td><td>${t.label}</td><td>${t.class}</td><td>${t.color}</td><td>${t.conf}</td><td>${t.u},${t.v}</td><td>${t.x_mm},${t.y_mm}</td><td>${t.hits}</td></tr>`;
@@ -417,14 +424,16 @@ def cmd_web(args):
         except Exception as e:
             log.warning("下位机不可用: %s", e)
 
-    def goto(u, v):
+    def goto(u, v, h=0.0):
         c = arm["client"]
         if c is None:
             return {"ok": False, "error": "未连接下位机 (启动时加 --arm)"}
         if not arm["lock"].acquire(blocking=False):    # 并发请求不能穿透: 一次只允许一个运动
             return {"ok": False, "error": "上一次移动还没结束"}
         try:
-            x, y = svc.calibrator.pixel_to_robot(float(u), float(v))
+            # h = 点击处离托盘底面的高度。0 只验平面标定; 填实际抓取高度 (货物高 × parallax_factor)
+            # 才会走透视位姿的高度投影, 这时夹爪对准的才是货物顶面中心而不是底面投影点。
+            x, y = svc.calibrator.pixel_to_robot(float(u), float(v), float(h or 0.0))
             arm["task"] = 200 + (arm["task"] - 199) % 50
             tid = arm["task"]
             try:
@@ -834,7 +843,8 @@ def cmd_web(args):
                             "arm": arm["client"] is not None, "tray_mode": svc.calibrator.tray_mode,
                             "tray": svc.calibrator.tray_status})
             elif u.path == "/api/pixel":
-                x, y = svc.calibrator.pixel_to_robot(float(q["u"]), float(q["v"]))
+                hh = float(q.get("h", ["0"])[0] or 0)
+                x, y = svc.calibrator.pixel_to_robot(float(q["u"]), float(q["v"]), hh)
                 self._json({"x_mm": round(x, 1), "y_mm": round(y, 1)})
             elif u.path == "/api/hsv":
                 from vision.color_calib import sample_hsv
@@ -914,7 +924,7 @@ def cmd_web(args):
                 self._json({"ok": True, "roi": pts})
             elif u == "/api/goto":
                 b = self._body()
-                self._json(goto(b.get("u", 0), b.get("v", 0)))
+                self._json(goto(b.get("u", 0), b.get("v", 0), b.get("h", 0)))
             elif u == "/api/camera":
                 self._json(camera_set(self._body()))
             elif u == "/api/color/add":

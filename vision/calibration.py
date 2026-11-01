@@ -156,6 +156,11 @@ class CoordinateCalibrator(VisionCalibrator):
             return self.principal_px
         if self.camera_matrix is not None:
             return float(self.camera_matrix[0, 2]), float(self.camera_matrix[1, 2])
+        wh = self._frame_wh()
+        if wh:
+            # 没有内参时按画面中心当光心。固定托盘(fixed_px)模式以前这里返回 None,
+            # 结果 correct_parallax 静默变成空操作 —— 畸变/位姿都求不出时, 高度视差就完全没做。
+            return wh[0] / 2.0, wh[1] / 2.0
         return None
 
     def correct_parallax(self, u: float, v: float, height_mm: float) -> Tuple[float, float]:

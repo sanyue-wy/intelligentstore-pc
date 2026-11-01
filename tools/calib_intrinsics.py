@@ -18,6 +18,10 @@ import glob
 import json
 import os
 
+# RDK X5 容器的 OpenCL 上下文不可用, undistortPoints 会无限挂起 (见 vision/__init__.py)。
+# 独立运行本脚本时不会加载 vision 包, 所以这里也要关一次。
+os.environ.setdefault("OPENCV_OPENCL_RUNTIME", "disabled")
+
 import cv2
 import numpy as np
 

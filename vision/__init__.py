@@ -5,6 +5,14 @@ STM32 智能分拣系统 - 视觉模块
 使用说明: GUIDE.md
 """
 
+import os as _os
+
+# RDK X5 容器里的 OpenCL 上下文不可用: cv2 先报 "can't create cl_mem handle", 之后
+# undistortPoints / initUndistortRectifyMap 会**无限挂起** (实测 vision 测试卡在畸变校正那一条,
+# 禁用后 0.45s 通过)。畸变页「一键校正」走的正是这条路径, 所以必须在 import cv2 前关掉。
+# 关掉只影响 OpenCV 的 GPU 加速, YOLO 走 BPU (hbm_runtime), 不受影响。
+_os.environ.setdefault("OPENCV_OPENCL_RUNTIME", "disabled")
+
 from .interfaces import (
     CameraInfo,
     ColorRange,
@@ -38,6 +46,14 @@ from .detector import (
 from .service import VisionService
 from .yolo_engine import YoloEngine, is_bpu_available
 from .yolo_detector import YoloWorkpieceDetector
+
+# 兜底: 若 cv2 在本包之前就被 import 过, 上面的环境变量已不生效, 再用运行时开关关一次。
+try:
+    import cv2 as _cv2
+
+    _cv2.ocl.setUseOpenCL(False)
+except Exception:      # cv2 未安装或没有 ocl 模块
+    pass
 
 __all__ = [
     # ---- 接口契约 ----
