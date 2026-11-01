@@ -1,0 +1,15 @@
+{
+  "_说明": [
+    "一键转换的远程编译机 (笔记本)。由 ./convert.sh --setup-remote 生成, 可手改。",
+    "remote: 用户名@IP;  remote_type: windows (Windows OpenSSH + WSL) | linux (Linux/WSL 内的 sshd)",
+    "wsl_distro: Windows 下指定 WSL 发行版名 (wsl -l -v 查看), 空 = 默认发行版",
+    "remote_init: 编译前执行的命令, 例 conda 环境: source ~/miniconda3/bin/activate rdk",
+    "remote_dir: 笔记本上的临时工作目录 (在 WSL 里)"
+  ],
+  "remote": "19149@192.168.254.163",
+  "remote_type": "windows",
+  "wsl_distro": "Ubuntu",
+  "remote_dir": "~/rdk_convert",
+  "remote_init": "",
+  "ssh_port": 22
+}

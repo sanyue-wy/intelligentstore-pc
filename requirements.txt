@@ -1,0 +1,10 @@
+# 上位机运行依赖 (RDK X5 容器 ubuntu:22.04 / Python 3.10)。容器里由 deploy/provision_intelligentstoring.sh 安装,
+# 与 Dockerfile、provision 的 PIP_CONSTRAINTS 保持一致; 脱离容器部署时: pip install -r requirements.txt
+# numpy 必须 < 2: 宿主 hobot_dnn / hbm_runtime 按 numpy 1.x 编译 (BPU 运行库从宿主挂载, 不在这里装)
+numpy==1.26.4
+# opencv 4.11 是最后支持 numpy 1.x 的版本; 板上有显示器用 opencv-python, 无界面可换 opencv-python-headless (同版本)
+opencv-python==4.11.0.86
+pillow>=9,<12
+psutil>=5.9
+pyserial>=3.5,<4
+onnxruntime>=1.16,<1.23

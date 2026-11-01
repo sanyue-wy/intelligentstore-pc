@@ -1,0 +1,55 @@
+[Unit]
+# ============================================================================
+# intelligentstoring.service —— 容器生命周期与依赖自愈（开机保活）
+#
+# 职责（只做「容器活着 + 依赖齐备」，**不启动任何 GUI 程序**）：
+#   1. 开机等 docker + 物理屏 :0 就绪（is_boot_guard.sh）
+#   2. 容器不存在则按标准参数创建；存在但停了则 start（provision 脚本，幂等）
+#   3. 依赖（tkinter / pyserial / opencv / 字体 / X 工具）缺失时自动补齐
+#   4. 补齐失败（如断网开机）→ 服务判失败，Restart=on-failure 定期重试
+#
+# 为什么不在这里启动 main.py：
+#   * 物理屏 :0 上已经由 x5_bigscreen.service 显示比赛大屏（赛项规定装置屏
+#     只显示分拣成功页）；调试界面在虚拟屏 :99 上运行、经 8756 /ui 远程查看。
+#   * 调试工作台做到「手动启动 + 崩溃自愈」即可 → intelligentstoring-debug@.service
+#
+# 设计要点（针对本机环境）：
+#   * Type=oneshot + RemainAfterExit=yes：主进程是短命的准备脚本，退出码 0
+#     才算成功，失败会被 systemd 真实捕获（不像 sorting_ui 的 Type=forking
+#     被 `exit 0` 掩盖成 active(exited)）。
+#   * 不因开机时网络慢而永久卡在失败态：StartLimitIntervalSec=0 + Restart=on-failure
+#     + RestartSec=60，失败每 60s 重试一次。
+# ============================================================================
+Description=STM32 智能分拣上位机 - 容器 intelligentstoring 保活与依赖自愈
+Documentation=file:/usr/local/share/doc/intelligentstoring/OPERATIONS.md
+After=docker.service network-online.target lightdm.service graphical.target
+Wants=network-online.target
+Requires=docker.service
+# 不因开机时网络/磁盘慢而永久卡在失败态：允许无限次重试（靠 RestartSec 控频）
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# 开机就绪等待（docker 最多 120s + :0 最多 180s）+ 物理屏 framebuffer/DPMS 锁定。
+# 超时退出码 1 → 触发 Restart=on-failure 重试。
+ExecStartPre=/usr/local/sbin/is_boot_guard.sh
+
+# 幂等：容器在→不动；停→start；不在→按标准参数重建，然后在容器内补齐依赖。
+ExecStart=/usr/local/sbin/provision_intelligentstoring.sh
+# 已齐备时 1s 内返回（只做 import 检查）；首次补齐依赖最多 15 分钟
+TimeoutStartSec=900
+
+# 失败自动重试（网络没就绪 / docker 慢 / apt 源暂时不通）
+Restart=on-failure
+RestartSec=60
+
+# exec 停止时不要连带杀容器（容器由 docker 自己的 restart policy 管）
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=intelligentstoring
+
+[Install]
+WantedBy=multi-user.target

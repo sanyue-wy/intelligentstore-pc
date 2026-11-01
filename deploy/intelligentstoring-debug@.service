@@ -1,0 +1,66 @@
+[Unit]
+# ============================================================================
+# intelligentstoring-debug@.service —— 调试工作台（手动启动 + 崩溃自愈）
+#
+# **不设开机自启**（无 [Install] 段，也不 enable）：
+#   物理屏 :0 只显示比赛大屏（x5_bigscreen.service，赛项规定装置屏只显示
+#   分拣成功页）。调试工作台跑在虚拟屏 :99（1280x820），经
+#   http://<X5-IP>:8756/ui 在笔记本浏览器里查看和操作，物理屏上不出现任何
+#   调试窗口 —— 因此两者可以并存，互不抢屏。
+#
+# 使用（推荐直接用 is_debug.sh）：
+#   /usr/local/sbin/is_debug.sh on                 # 综合工作台（默认实例）
+#   /usr/local/sbin/is_debug.sh on --comm          # 通讯调试器
+#   /usr/local/sbin/is_debug.sh on --vision        # 视觉调试器
+#   /usr/local/sbin/is_debug.sh on --msg           # 消息中心
+#   /usr/local/sbin/is_debug.sh on --monitor       # 监控看板
+#   /usr/local/sbin/is_debug.sh off                # 全部关闭
+#   /usr/local/sbin/is_debug.sh status|log|open
+#
+#   等价 systemd 写法: systemctl start|stop intelligentstoring-debug@<参数>
+#   无参数的实例名:   systemctl start|stop intelligentstoring-debug (即 @default)
+#
+# 崩溃自愈：
+#   Type=simple —— docker exec 进程即主进程，容器内 python 退出 => 服务退出，
+#   systemd 能看到真实退出码（不重蹈 sorting_ui 的 Type=forking + exit 0
+#   把崩溃掩盖成 active(exited) 的覆辙）。Restart=always + RestartSec=5
+#   => 崩溃后 5s 自动拉起；用 is_debug.sh off (systemctl stop) 才是正常关闭。
+# ============================================================================
+Description=STM32 智能分拣上位机 - 调试工作台 (:99 虚拟屏, 参数=%i)
+Documentation=file:/usr/local/share/doc/intelligentstoring/OPERATIONS.md
+After=docker.service network-online.target x5_remote.service
+Wants=network-online.target x5_remote.service
+Requires=docker.service intelligentstoring.service
+# 崩溃自愈无限重试（靠 RestartSec=5 限速），不被 systemd 默认 5 次/10s 卡死
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=CONTAINER=intelligentstoring
+Environment=MAIN_ARGS=%i
+
+# 就绪检查：容器在跑 + 依赖齐备（不齐就现场补齐）
+ExecStartPre=/usr/local/sbin/provision_intelligentstoring.sh --quiet
+# :99 由 x5_remote.service 负责创建 Xvfb
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do DISPLAY=:99 xdpyinfo >/dev/null 2>&1 && exit 0; sleep 1; done; echo "虚拟屏 :99 不可用（x5_remote.service 未起？）" >&2; exit 1'
+
+# 前台运行：docker exec 阻塞到 python 退出，退出码即本服务退出码
+ExecStart=/usr/bin/docker exec -e DISPLAY=:99 -e PYTHONUNBUFFERED=1 intelligentstoring bash -c 'cd /app && exec python3 main.py $MAIN_ARGS'
+
+# 运行时守护
+Restart=always
+RestartSec=5
+# 连续崩溃（例如代码本身有 bug、一启动就死）时不要把 CPU 打满：
+# 5 次之内 RestartSec=5；超过后 systemd 会按指数退避（最长 ~60s）。
+# 配合 StartLimitIntervalSec=0 结果是「永远会重试，但不会狂转」。
+
+# 停止时只杀 docker exec 客户端，不给容器发信号；再补一刀清掉容器内进程，
+# 保证下次 start 不会因为残留进程重复开窗。
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=20
+ExecStopPost=-/bin/bash -c 'docker exec intelligentstoring pkill -f "[m]ain.py" || true'
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=is-debug

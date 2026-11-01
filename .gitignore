@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+records/
+tools/build/
+tools/.convert_ssh/
+deploy/.bpu_bridge.args
+dataset/
+vision/models/old/
+vision/calib_config.json.bak
+vision/classes.json.bak
+tools/chess_images/
+tools/.web_token
+core.*

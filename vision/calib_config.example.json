@@ -1,0 +1,25 @@
+{
+  "_说明": [
+    "复制为 calib_config.json 后修改; 也可以全部在浏览器调试台「托盘」「畸变」页填写, 会自动写入。",
+    "托盘坐标系: 原点 = 画面左上方的内框角 (托盘底面内壁), +x 沿画面向右 (长度 inner_w_mm), +y 沿画面向下 (inner_h_mm)。",
+    "rim_mm: 白色区域外边界到内框的距离 (外围贴黑边时 = 托盘壁厚); rim_height_mm: 壁顶比底面高多少。",
+    "axes: 机械臂 +X / +Y 分别对应托盘哪个方向; ref_points >= 2 个时自动求旋转, 此项忽略。",
+    "ref_points: 尺子量出的托盘坐标 + 机械臂真实坐标; 浏览器里点击画面添加的点 src=click。>=5 点做一阶、>=9 点做二阶残差修正。",
+    "cam_height_mm: 镜头光心到托盘底面高度, 用于货物高度视差和壁顶视差校正; 0 = 不校正。",
+    "camera_matrix / dist_coeffs: 棋盘格标定 (畸变页) 或托盘直边估计写入; 没有就不做去畸变。",
+    "corners_px: 程序自动维护 (上次锁定的托盘角点), 不用手填。"
+  ],
+  "cam_height_mm": 420.0,
+  "tray": {
+    "enabled": true,
+    "inner_w_mm": 240.0,
+    "inner_h_mm": 180.0,
+    "rim_mm": 4.0,
+    "rim_height_mm": 15.0,
+    "axes": ["tray_y", "-tray_x"],
+    "ref_points": [
+      {"tray_mm": [20.0, 20.0], "robot_mm": [120.0, 60.0], "src": "manual"}
+    ],
+    "auto_roi": true
+  }
+}

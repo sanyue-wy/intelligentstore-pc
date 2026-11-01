@@ -1,0 +1,41 @@
+# ============================================================================
+# /etc/logrotate.d/intelligentstoring
+#
+# 宿主机根分区 EXT4 已损坏（FS Error count 58，SD 卡介质问题），必须严格控量：
+#   * 单个日志 > 5MB 就轮转（不是按天等），避免程序异常刷日志把盘写满
+#   * 每个文件最多保留 2 份，压缩后总量上限 ~15MB
+#   * 所有日志集中在一个独立目录 /var/log/intelligentstoring，便于整体清理
+#
+# 由 logrotate.timer（systemd，ubuntu 默认已启用，00:00 起每小时）驱动。
+# 手动验证: logrotate -d /etc/logrotate.d/intelligentstoring   (dry-run)
+#           logrotate -f /etc/logrotate.d/intelligentstoring   (强制执行一次)
+#
+# 说明: /var/log/intelligentstoring 挂进容器 (/app/logs)，容器内程序
+#       用 RotatingFileHandler(5MB x 2) 自管；宿主这里是第二道闸门，
+#       覆盖 journal 之外的遗留文件与异常退出报告 (crash.log)。
+# ============================================================================
+/var/log/intelligentstoring/*.log {
+    size 5M
+    rotate 2
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    nodateext
+    su root root
+    createolddir 0755 root root
+}
+
+# 容器内日志目录（bind mount 时宿主可见；不存在时 missingok 跳过）
+/var/log/intelligentstoring/container/*.log {
+    size 5M
+    rotate 2
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    nodateext
+    su root root
+}

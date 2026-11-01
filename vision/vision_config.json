@@ -1,0 +1,57 @@
+{
+  "_说明": [
+    "视觉模块唯一配置文件。环境变量可临时覆盖 (见 vision/config.py 顶部)。",
+    "camera.type: uvc=USB摄像头, hikrobot=海康工业相机, replay=图片/视频回放, synthetic=仿真",
+    "camera.exposure_us / gain_db / wb_kelvin: 比赛现场建议全部锁定 (null=自动)。",
+    "model.path 为空时自动取 vision/models/ 下最新的 .bin (板端) / .onnx / .pt。",
+    "model.class_conf: 按类别单独设置置信度阈值, 例 {\"cube_qr\": 0.30}",
+    "detect.roi: 托盘区域多边形 [[u,v],...] (像素), 区域外的检测一律丢弃; [] = 不限制。用 vision_tool roi 交互生成。",
+    "detect.edge_margin_px: 贴着画面边缘被截断的目标定位不准, 丢弃距边缘小于该值的框。",
+    "record.enabled: 每次 scan 保存原图与标注图, 赛后复盘/补充训练数据。record.dir 相对路径按工程根目录 (宿主上持久保存, 也是一键转换的量化校准图来源)。"
+  ],
+  "backend": "yolo",
+  "camera": {
+    "type": "uvc",
+    "device": 0,
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "fourcc": "MJPG",
+    "serial": "",
+    "path": "",
+    "exposure_us": null,
+    "gain_db": null,
+    "wb_kelvin": null,
+    "swap_rb": false,
+    "stale_s": 2.0
+  },
+  "model": {
+    "path": "",
+    "backend": "",
+    "conf": 0.40,
+    "iou": 0.50,
+    "max_det": 40,
+    "class_conf": {}
+  },
+  "detect": {
+    "refine": true,
+    "decode_qr": true,
+    "parallax_factor": 0.6,
+    "min_area_px": 250,
+    "max_area_px": 0,
+    "roi": [],
+    "edge_margin_px": 0
+  },
+  "scan": {
+    "frames": 5,
+    "skip_frames": 1,
+    "min_hit_ratio": 0.5,
+    "match_px": 25,
+    "timeout_s": 3.0
+  },
+  "record": {
+    "enabled": true,
+    "dir": "records/scans",
+    "keep": 300
+  }
+}

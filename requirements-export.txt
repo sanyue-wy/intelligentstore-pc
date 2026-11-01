@@ -1,0 +1,9 @@
+# 板上一键转换 (.pt -> ONNX, tools/convert_model.py) 额外依赖。torch 用 CPU 版:
+#   pip install -r requirements.txt
+#   pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.1,<2.9"
+#   pip install -r requirements-export.txt
+# convert_model.py 依赖 ultralytics 内部的 Detect(cv2/cv3/nl) 结构, 8.x 全系一致。
+# 建议锁成训练 .pt 时用的那个版本 (训练机上 pip show ultralytics), 改这里一行即可。
+ultralytics>=8.1,<9
+# hb_mapper 只接受 opset 11; onnx 1.19+ 未验证
+onnx>=1.15,<1.19
