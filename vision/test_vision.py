@@ -450,5 +450,66 @@ class TestReviewFixes(unittest.TestCase):
         self.assertEqual(errs, [])
 
 
+class TestPoseValidation(unittest.TestCase):
+    """阶段 0: 镜头高反推焦距的收敛性与容差校验。
+
+    现场四角 + 160x160 内框的实测配置。焦距-高度曲线是单峰的, 旧的单调二分会夹在边界
+    上并仍返回 ok=True; 现在超出可达范围必须明确失败并退回平面单应。
+    """
+
+    CORNERS = np.float32([[179, 127], [483, 122], [624, 400], [46, 388]])
+
+    def _G(self):
+        from vision import tray as T
+        inner = T.inner_tray_pts({"inner_w_mm": 160, "inner_h_mm": 160})
+        return T.cv2.getPerspectiveTransform(np.float32(inner), self.CORNERS).astype(np.float64)
+
+    def _cfg(self, cam_h):
+        import json, tempfile, os
+        p = os.path.join(tempfile.mkdtemp(), "c.json")
+        tray = {"enabled": True, "inner_w_mm": 160.0, "inner_h_mm": 160.0,
+                "fixed_px": {"corners": self.CORNERS.tolist(), "image_size": [640, 480]}}
+        with open(p, "w") as f:
+            json.dump({"tray": tray, "image_size": [640, 480], "cam_height_mm": cam_h}, f)
+        return p
+
+    def test_reachable_height_is_accepted(self):
+        from vision import tray as T
+        p = T.estimate_pose(self._G(), (320.0, 240.0), (640, 480), cam_height_mm=115.0)
+        self.assertTrue(p["ok"], p.get("msg"))
+        self.assertEqual(p["source"], "cam_height")
+        self.assertLessEqual(abs(p["height_mm"] - 115.0), 0.15 * 115.0)
+
+    def test_height_too_small_is_rejected(self):
+        from vision import tray as T
+        p = T.estimate_pose(self._G(), (320.0, 240.0), (640, 480), cam_height_mm=10.0)
+        self.assertFalse(p["ok"], "10mm 低于该四角可达的最小镜头高, 必须失败")
+        self.assertIn("相差", p["msg"])
+        self.assertGreater(p["height_mm"], 10.0)      # 报的是真实可达值, 不是填写值
+
+    def test_height_too_large_is_rejected(self):
+        from vision import tray as T
+        p = T.estimate_pose(self._G(), (320.0, 240.0), (640, 480), cam_height_mm=5000.0)
+        self.assertFalse(p["ok"], "5000mm 超出可达范围, 不能再静默返回 ok")
+
+    def test_fallback_to_planar_when_pose_fails(self):
+        cal = CoordinateCalibrator(self._cfg(10.0))
+        st = cal.tray_status["perspective"]
+        self.assertNotEqual(st["method"], "pose")
+        self.assertIn("相差", st["msg"])
+        self.assertIsNotNone(cal.tray_H)                    # 平面单应仍然可用
+        x, y = cal.pixel_to_tray(320.0, 240.0)
+        self.assertTrue(np.isfinite(x) and np.isfinite(y))
+
+    def test_self_check_missing_ref_points_is_actionable(self):
+        svc = VisionService(MessageBus())
+        svc.calibrator = CoordinateCalibrator(self._cfg(115.0))
+        rep = svc.self_check(log=False)
+        txt = " ".join(rep["problems"])
+        self.assertIn("参考点", txt)
+        self.assertNotIn("不存在", txt, "标定文件存在时不能再报「不存在」")
+        self.assertTrue(any("畸变" in h for h in rep["hints"]), "未做畸变校正应作为单独提示")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,8 +9,9 @@ STM32 智能分拣系统 - 视觉标定模块 (Pixel -> Robot Coordinate Calibra
      (用 tools/calib_intrinsics.py 棋盘格标定得到), 先 undistortPoints 再做单应。
      广角 USB 摄像头边缘畸变常有 3~8 像素, 不校正时托盘边缘工件会抓偏。
   3. 视差(高度)校正: 单应矩阵只对"标定平面"(托盘底面) 成立。工件有高度,
-     从斜上方看, 顶面会沿径向向外偏。给出相机光心像素 (cx,cy) 与相机离
-     托盘面的高度 cam_height_mm 后, 按
+     从斜上方看, 顶面会沿径向向外偏。给出相机光心像素 (cx,cy) 与
+     cam_height_mm —— **镜头光心到托盘底面的垂直高度 (mm)**, 量的是竖直距离,
+     不是到托盘边缘的斜距, 也不是到货物顶面的距离 —— 后, 按
          p_plane = c + (p_img - c) * (H - h) / H
      把识别点拉回托盘平面。40mm 高工件、相机高 300mm 时, 偏离中心 150px
      的工件可修正约 20px (≈ 数毫米)。cam_height_mm=0 表示关闭。
@@ -220,9 +221,14 @@ class CoordinateCalibrator(VisionCalibrator):
             elif self.tray_tracker is not None and self.tray_tracker.stable is not None:
                 t["corners_px"] = np.round(self.tray_tracker.stable, 2).tolist()
             data["tray"] = t
-        data.update({"src_pixels": self.src_pixels.tolist(),
-                     "dst_robot_mm": self.dst_robot_mm.tolist(),
-                     "reproj_error_mm": round(self.reproj_error_mm, 3)})
+            # 托盘模式下这三个顶层字段只是「四角 + 参考点」的派生展示值, 加载时走托盘分支不会读回,
+            # 不再写入, 并顺手清掉历史残留 (它们和 tray.fixed_px.corners 重复, 容易看混)
+            for k in ("src_pixels", "dst_robot_mm", "reproj_error_mm"):
+                data.pop(k, None)
+        else:
+            data.update({"src_pixels": self.src_pixels.tolist(),
+                         "dst_robot_mm": self.dst_robot_mm.tolist(),
+                         "reproj_error_mm": round(self.reproj_error_mm, 3)})
         if self.image_size:
             data["image_size"] = list(self.image_size)
         if self.cam_height_mm:

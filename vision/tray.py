@@ -457,12 +457,52 @@ def estimate_k1(frame: np.ndarray, cfg: Dict) -> Dict:
 
 
 # ============================================================================ 透视 / 相机位姿
+def _focal_from_height(solve, f0: float, target_mm: float,
+                       tol: float = 0.15) -> Tuple[float, bool, float]:
+    """
+    求使相机高度等于 target_mm 的焦距。
+
+    高度对焦距**不是单调的**: 四个共面点 + 已知光心时平面位姿有两种解 (经典二义性),
+    高度曲线是单峰的 (先升后降), 单调二分会在两端夹死并给出相差数倍的"解"。
+    所以先在对数网格上粗扫, 找到最接近目标的分支, 再在邻域内黄金分割细化。
+    返回 (f, 是否落在容差内, 该 f 下的高度)。
+    """
+    lo, hi = 0.15 * f0, 8.0 * f0
+    fs = np.geomspace(lo, hi, 96)
+    hs = np.array([solve(float(f))["height_mm"] for f in fs], np.float64)
+    i = int(np.argmin(np.abs(hs - target_mm)))
+    a = float(fs[max(0, i - 1)])
+    b = float(fs[min(len(fs) - 1, i + 1)])
+    if b <= a:
+        a, b = lo, hi
+    g = (math.sqrt(5) - 1) / 2
+
+    def cost(f):
+        return abs(solve(float(f))["height_mm"] - target_mm)
+
+    c, d = b - g * (b - a), a + g * (b - a)
+    fc, fd = cost(c), cost(d)
+    for _ in range(48):
+        if fc < fd:
+            b, d, fd = d, c, fc
+            c = b - g * (b - a)
+            fc = cost(c)
+        else:
+            a, c, fc = c, d, fd
+            d = a + g * (b - a)
+            fd = cost(d)
+    f = (a + b) / 2.0
+    h = float(solve(f)["height_mm"])
+    return f, abs(h - target_mm) <= tol * target_mm, h
+
+
 def estimate_pose(G: np.ndarray, principal: Tuple[float, float], frame_wh: Tuple[int, int],
                   focal: Optional[float] = None, z0: float = 0.0,
                   cam_height_mm: float = 0.0, min_tilt_deg: float = 12.0) -> Dict:
     """
     G: 托盘平面 (z=z0, 单位 mm) -> 去畸变像素 的单应 (3x3)。
-    焦距来源: focal (已知) > cam_height_mm (二分求使相机高度相符的焦距) > 由单应自估
+    焦距来源: focal (已知) > cam_height_mm (按镜头高反推, 见 _focal_from_height;
+    反算高度与填写值相差超过 15% 时返回 ok=False, 上层退回平面单应) > 由单应自估
     (矩形两边正交且等比例; 相机倾斜 < min_tilt_deg 时自估不可靠, 返回 ok=False)。
     返回 {"ok", "f", "tilt_deg", "height_mm"(相机到底面), "col"(每 mm 高度对单应第三列的增量),
           "z0", "G", "source", "msg"}
@@ -504,14 +544,17 @@ def estimate_pose(G: np.ndarray, principal: Tuple[float, float], frame_wh: Tuple
         u = -(A @ B) / max(float(A @ A), 1e-12)
         f_self = f0 / math.sqrt(u) if u > 0 else None
         if cam_height_mm and cam_height_mm > z0:
-            lo, hi = 0.15 * f0, 6.0 * f0
-            for _ in range(60):                          # 相机高度随焦距单调增
-                m = math.sqrt(lo * hi)
-                if solve(m)["height_mm"] < cam_height_mm:
-                    lo = m
-                else:
-                    hi = m
-            f, src = math.sqrt(lo * hi), "cam_height"
+            f, ok_h, h_at_f = _focal_from_height(solve, f0, float(cam_height_mm))
+            if not ok_h:
+                # 反推不出与填写值自洽的焦距: 不能拿这个位姿去算坐标, 让上层退回平面单应
+                return {"ok": False, "f": float(f), "height_mm": round(h_at_f, 1),
+                        "tilt_deg": round(float(solve(f)["tilt_deg"]), 2),
+                        "source": "cam_height",
+                        "msg": (f"按镜头高 {cam_height_mm:.0f} mm 反推焦距失败: 这组四角/尺寸下可达到的镜头高"
+                                f"最接近 {h_at_f:.0f} mm, 相差 {abs(h_at_f - cam_height_mm) / cam_height_mm:.0%}。"
+                                f"检查镜头高是否量错、内框 W/H 是否填反、四角是否点在同一高度;"
+                                f"广角镜头先做一次畸变校正 (畸变页「一键校正」)")}
+            src = "cam_height"
         elif f_self and 0.3 * f0 < f_self < 4.0 * f0:
             f, src = f_self, "self"
         else:

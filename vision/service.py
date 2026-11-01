@@ -242,7 +242,7 @@ class VisionService(VisionServiceBase):
     # ================================================================== 自检
     def self_check(self, log: bool = True) -> Dict[str, Any]:
         """一次性检查 相机/模型/类别/标定/ROI, 返回报告 (log=True 时写日志)。"""
-        rep: Dict[str, Any] = {"ok": True, "problems": [], "config": self.cfg.source}
+        rep: Dict[str, Any] = {"ok": True, "problems": [], "hints": [], "config": self.cfg.source}
         g = self._grabber
         frame = g.latest()[0] if g else None
         cam = g.camera if g else None
@@ -267,12 +267,17 @@ class VisionService(VisionServiceBase):
         else:
             rep["engine"] = {"ready": False, "desc": "HSV 颜色检测 (未启用 YOLO 后端)"}
         cal = self.calibrator
-        rep["calibration"] = {"calibrated": cal.is_calibrated, "points": int(len(cal.src_pixels)),
+        cfg_found = os.path.exists(cal.config_path)
+        rep["calibration"] = {"calibrated": cal.is_calibrated, "config_found": cfg_found,
+                              "points": int(len(cal.src_pixels)),
                               "reproj_error_mm": round(cal.reproj_error_mm, 2),
                               "undistort": cal.camera_matrix is not None,
                               "cam_height_mm": cal.cam_height_mm}
-        if not cal.is_calibrated:
-            rep["problems"].append("未标定 (vision/calib_config.json 不存在), 坐标不可信")
+        # 托盘模式下 "未标定" 的真实原因是没有参考点/origin_mm, 由下面 tray 段给出可操作提示, 这里不重复报
+        if not cfg_found:
+            rep["problems"].append(f"没有标定文件 {cal.config_path}, 正在用默认占位标定, 坐标不可信")
+        elif not cal.is_calibrated and not cal.tray_mode:
+            rep["problems"].append("标定文件里没有有效标定点, 坐标不可信 (重新标定)")
         elif cal.reproj_error_mm > 2.0:
             rep["problems"].append(f"标定重投影误差 {cal.reproj_error_mm:.1f}mm 偏大, 建议重标")
         if frame is not None:
@@ -295,10 +300,25 @@ class VisionService(VisionServiceBase):
                 rep["problems"].append("托盘角点来自上次保存, 本次还没在实时画面里锁定")
             if ts.get("warn"):
                 rep["problems"].append(ts["warn"])
-            if (ts.get("perspective") or {}).get("warn"):
-                rep["problems"].append(ts["perspective"]["warn"])
+            persp = ts.get("perspective") or {}
+            if persp.get("warn"):
+                rep["problems"].append(persp["warn"])
+            if persp.get("msg") and persp.get("method") != "pose":
+                rep["problems"].append(
+                    f"透视位姿没启用, 已退回"
+                    f"{'径向视差' if persp.get('method') == 'radial' else '平面单应'}校正 "
+                    f"(相机斜看时高度视差会有偏差): {persp['msg']}")
             if not ts.get("ref_points") and cal.tray_cfg.get("origin_mm") is None:
-                rep["problems"].append("托盘模式没有参考点 (tray.ref_points) 也没有 origin_mm, 机械臂坐标只差一个平移, 不可信")
+                rep["problems"].append(
+                    "托盘模式没有参考点 (tray.ref_points) 也没有 origin_mm: 机械臂坐标只差一个平移, 不可信。"
+                    "下一步: 打开调试台 http://<板子IP>:8090 → 托盘页 → 加参考点 "
+                    "(尺子量 2~9 个固定点的托盘坐标 + 机械臂坐标; 接了下位机时用 ./is.sh web --arm, "
+                    "点画面会自动读机械臂当前坐标), 或直接填 origin_mm")
+            if cal.camera_matrix is None or cal.dist_coeffs is None:
+                rep["hints"].append(
+                    "未做畸变校正 (calib_config.json 没有 camera_matrix / dist_coeffs): 广角镜头边缘会偏, "
+                    "四角与参考点可能对不上。建议: 调试台 → 畸变页 →「一键校正」"
+                    "(打印 tools/calib_board_A4.pdf 平铺在托盘上拍一张; 没有打印机可用托盘页的直边估计)")
         rep["roi"] = bool(getattr(self.detector, "roi", None) is not None)
         rep["problems"] += self.warnings
         ev_t, ev = self._tray_event

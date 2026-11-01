@@ -244,7 +244,7 @@ HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>视觉调试�
 #l{padding:8px}#r{padding:8px;flex:1;font-size:13px;max-width:560px}img{border:1px solid #555}#v{cursor:crosshair}
 button{margin:2px;padding:6px 10px;background:#335;color:#fff;border:0;border-radius:4px;cursor:pointer}
 button.on{background:#a60}table{border-collapse:collapse}td,th{border:1px solid #444;padding:2px 5px}
-pre{white-space:pre-wrap;background:#111;padding:6px;max-height:200px;overflow:auto}.bad{color:#f66}.ok{color:#3d8}
+pre{white-space:pre-wrap;background:#111;padding:6px;max-height:200px;overflow:auto}.bad{color:#f66}.ok{color:#3d8}.hint{color:#fa4}
 .tabs button{background:#223}.tabs button.on{background:#a60}.pane{display:none}.pane.on{display:block}
 input[type=range]{width:220px}#msg{color:#fb3;min-height:18px}.thumb{width:160px;cursor:pointer}</style></head>
 <body><div id="l"><img id="v" src="/stream"><br>
@@ -262,7 +262,8 @@ input[type=range]{width:220px}#msg{color:#fb3;min-height:18px}.thumb{width:160px
 <div class="pane" id="p_tray"><p>托盘坐标系: 原点 = 画面左上方的内框角, +x 沿画面向右, +y 沿画面向下。画面里绿框 = 检测到的白色外边界 (红 = 本帧没检测到), 青框 = 推算的内框, 红/绿箭头 = 托盘 +x/+y, 紫叉 = 参考点。</p>
  <label><input type="checkbox" id="tr_en"> 启用托盘模式</label> <label><input type="checkbox" id="tr_roi"> 托盘内框自动作 ROI</label><br>
  内框 W (左右) <input id="tr_w" size="5"> mm  H (上下) <input id="tr_h" size="5"> mm<br>
- 外沿 rim <input id="tr_rim" size="4"> mm (白色外边界到内框)  壁高 <input id="tr_rh" size="4"> mm  镜头高 <input id="tr_ch" size="5"> mm (到托盘底面)<br>
+ 外沿 rim <input id="tr_rim" size="4"> mm (白色外边界到内框)  壁高 <input id="tr_rh" size="4"> mm
+ 镜头高 <input id="tr_ch" size="5"> mm (镜头光心到托盘底面的垂直高度; 和反算值差得多会报警)<br>
  机械臂 +X = <select id="tr_ax"><option>tray_x</option><option>-tray_x</option><option>tray_y</option><option>-tray_y</option></select>
  机械臂 +Y = <select id="tr_ay"><option>tray_y</option><option>-tray_y</option><option>tray_x</option><option>-tray_x</option></select> (≥2 个参考点时自动求, 此项忽略)<br>
  <b>参考点</b> (托盘坐标 → 机械臂坐标; 也可在「标定/ROI」页点击画面添加):<div id="tr_refs"></div>
@@ -369,6 +370,7 @@ async function arch(id,scan){let note=prompt('备注 (哪里识别错了)','');i
 let TRAYMODE=false;
 async function refresh(){let s=await J('/api/status');ARM=s.arm;TRAYMODE=s.tray_mode;$('gotobox').style.display=ARM?'':'none';
  let p=s.problems.length?'<span class=bad>'+s.problems.join('\n')+'</span>':'<span class=ok>无问题</span>';
+ if(s.hints&&s.hints.length)p+='\n<span class=hint>提示: '+s.hints.join('\n')+'</span>';
  $('st').innerHTML=`相机: ${s.camera}\nFPS: ${s.fps}  相机FPS: ${s.camera_fps}\n引擎: ${s.engine}\n标定: ${s.calib}${s.tray_mode?`\n托盘: ${s.tray.ok?'已定位':'未定位'} ${s.tray.msg||''} 参考点 ${s.tray.ref_points||0} 个 误差 ${JSON.stringify(s.tray.per_point_mm||[])} mm`:''}\n下位机: ${s.arm?'已连接 (--arm)':'未连接'}\n${p}`;
  let c=await J('/api/calib/list');$('cp').innerHTML=c.points.map((q,i)=>`${i+1}: 像素(${q.u},${q.v}) -> (${q.x},${q.y})`).join('<br>')||'(无)'}
 setInterval(refresh,2500);refresh();
@@ -827,7 +829,8 @@ def cmd_web(args):
                             "camera_fps": rep["camera"]["fps"], "engine": rep["engine"]["desc"],
                             "calib": f"{cal['points']} 点, 误差 {cal['reproj_error_mm']} mm, "
                                      f"{'已标定' if cal['calibrated'] else '未标定'}",
-                            "problems": rep["problems"], "last_scan": svc.last_scan,
+                            "problems": rep["problems"], "hints": rep.get("hints", []),
+                            "last_scan": svc.last_scan,
                             "arm": arm["client"] is not None, "tray_mode": svc.calibrator.tray_mode,
                             "tray": svc.calibrator.tray_status})
             elif u.path == "/api/pixel":
