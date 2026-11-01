@@ -751,7 +751,11 @@ def cmd_web(args):
             self.wfile.write(b)
 
         def _json(self, obj, code=200):
-            self._send(json.dumps(obj, ensure_ascii=False, default=str).encode(), "application/json; charset=utf-8", code)
+            try:
+                from webui.base import json_bytes as _jb
+                self._send(_jb(obj), "application/json; charset=utf-8", code)
+            except Exception:
+                self._send(json.dumps(obj, ensure_ascii=False, default=str).encode(), "application/json; charset=utf-8", code)
 
         def _body(self):
             n = int(self.headers.get("Content-Length") or 0)

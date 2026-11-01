@@ -56,5 +56,22 @@ def token_ok(headers, token: str) -> bool:
     return False
 
 
+def _sanitize(obj):
+    """递归把 nan / inf 转成 None。
+
+    json.dumps 默认允许 NaN/Infinity, 但这不是标准 JSON, 浏览器 JSON.parse 会直接
+    抛 SyntaxError —— 通讯调试页 link_age_s 在还没有收到状态帧时是 float('inf'),
+    会导致 /api/comm/state 变成非法 JSON、前端解析失败而误显示"通讯客户端不可用"。
+    """
+    if isinstance(obj, float):
+        return obj if obj == obj and obj not in (float("inf"), float("-inf")) else None
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    return obj
+
+
 def json_bytes(obj) -> bytes:
-    return json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8")
+    return json.dumps(_sanitize(obj), ensure_ascii=False, default=str,
+                      allow_nan=False).encode("utf-8")

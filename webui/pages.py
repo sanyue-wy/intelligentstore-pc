@@ -93,7 +93,7 @@ async function refresh(){
     ['报警',st.alarm?'是':'否'],['取件位',st.pick_ready?'是':'否'],
     ['坐标',(st.x_mm!==undefined?st.x_mm:'-')+', '+(st.y_mm!==undefined?st.y_mm:'-')+' mm'],
     ['res_flags','0x'+(st.res_flags||0).toString(16)],['res_stage',st.res_stage],
-    ['储物槽',st.storage_slot],['链路年龄',d.age_s+' s']];
+    ['储物槽',st.storage_slot],['链路年龄',(d.age_s===null||d.age_s===undefined)?'-':(d.age_s+' s')]];
   $('status').innerHTML=R.map(r=>'<tr><th>'+r[0]+'</th><td>'+esc(r[1])+'</td></tr>').join('');
   renderLog(d.logs||[]);
 }

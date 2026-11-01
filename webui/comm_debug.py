@@ -7,8 +7,18 @@ communication 模块现成接口。
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
+
+
+def _finite(v):
+    """把 link_age_s 之类的值收窄成有限 float; inf/nan -> None (浏览器 JSON.parse 不认 Infinity)。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return round(f, 1) if math.isfinite(f) else None
 
 
 class CommDebug:
@@ -111,7 +121,7 @@ class CommDebug:
             "link": getattr(c, "link_description", "") if callable(getattr(c, "link_description", None))
                     else getattr(c, "link_description", ""),
             "alive": bool(getattr(c, "is_link_alive", False)),
-            "age_s": round(float(getattr(c, "link_age_s", 0) or 0), 1),
+            "age_s": _finite(getattr(c, "link_age_s", None)),
         }
         if st is not None:
             d["status"] = {
@@ -127,7 +137,7 @@ class CommDebug:
                 "y_mm": round(float(getattr(st, "cur_y_mm", 0) or 0), 1),
                 "busy": bool(getattr(st, "is_busy", False)),
                 "estop": bool(getattr(st, "is_estop", False)),
-                "alarm": bool(getattr(st, "has_alarm", False)),
+                "alarm": bool(getattr(st, "is_alarm", False)),
                 "pick_ready": bool(getattr(st, "is_pick_ready", False)),
             }
         d["logs"] = self._tail()
