@@ -30,52 +30,18 @@
     "rim_mm": 0.0,
     "rim_height_mm": 15.0,
     "axes": [
-      "tray_x",
-      "tray_y"
+      "tray_y",
+      "-tray_x"
     ],
     "ref_points": [],
-    "origin_mm": null
+    "origin_mm": [
+      0.0,
+      190.0
+    ]
   },
-  "src_pixels": [
-    [
-      179.0,
-      127.0
-    ],
-    [
-      483.0,
-      122.0
-    ],
-    [
-      624.0,
-      400.0
-    ],
-    [
-      46.0,
-      388.0
-    ]
-  ],
-  "dst_robot_mm": [
-    [
-      0.0,
-      0.0
-    ],
-    [
-      160.0,
-      0.0
-    ],
-    [
-      160.0,
-      160.0
-    ],
-    [
-      0.0,
-      160.0
-    ]
-  ],
-  "reproj_error_mm": 0.0,
   "image_size": [
     640,
     480
   ],
-  "cam_height_mm": 115.0
+  "cam_height_mm": 155.0
 }
