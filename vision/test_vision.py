@@ -514,5 +514,34 @@ class TestPoseValidation(unittest.TestCase):
         self.assertTrue(any("畸变" in h for h in rep["hints"]), "未做畸变校正应作为单独提示")
 
 
+class TestClassMeta(unittest.TestCase):
+    """classes.json 的元数据必须按「模型类名」索引。
+
+    旧实现用 c["id"] (int) 当键, 上层却拿 d.name (str) 查, 结果 height_mm / thin_wall /
+    decode_qr / info 全部失效 (高度恒为 0, 视差校正等于没做)。
+    """
+
+    def test_meta_keyed_by_model_class_name(self):
+        import json, tempfile, os
+        from vision.yolo_detector import YoloWorkpieceDetector
+
+        class _StubEngine:
+            class_names = ["红色镂空立方体", "黄色三棱柱"]
+            is_ready = False
+            last_error = "stub"
+
+            def describe(self):
+                return "stub"
+
+        p = os.path.join(tempfile.mkdtemp(), "classes.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"classes": [{"id": 0, "shape_cn": "hollow_cube", "height_mm": 30},
+                                   {"id": 1, "shape_cn": "tri_prism", "height_mm": 30}]}, f)
+        det = YoloWorkpieceDetector(engine=_StubEngine(), meta_path=p)
+        self.assertEqual(set(det.class_meta), {"红色镂空立方体", "黄色三棱柱"})
+        self.assertEqual(det.class_meta["黄色三棱柱"]["shape_cn"], "tri_prism")
+        self.assertEqual(det.class_meta["红色镂空立方体"]["height_mm"], 30)
+
+
 if __name__ == "__main__":
     unittest.main()

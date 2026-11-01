@@ -63,7 +63,6 @@ class YoloWorkpieceDetector(WorkpieceDetector):
         det_cfg, mdl = self.cfg.detect, self.cfg.model
         self.meta_path = meta_path or os.path.join(CUR_DIR, "classes.json")
         self.meta = self._load_meta(self.meta_path)
-        self.class_meta: Dict[str, dict] = {c["id"]: c for c in self.meta.get("classes", [])}
         self.color_cn: Dict[str, str] = self.meta.get("color_names", {})
         self.hsv_cfg: dict = self.meta.get("hsv", {})
         self.engine: InferenceEngineBase = engine or YoloEngine(
@@ -71,6 +70,16 @@ class YoloWorkpieceDetector(WorkpieceDetector):
             class_names=load_class_names(self.meta_path),
             conf_thresh=float(mdl.get("conf", 0.4)), iou_thresh=float(mdl.get("iou", 0.5)),
             max_det=int(mdl.get("max_det", 40)), class_conf=mdl.get("class_conf") or {})
+        # classes.json 的条目用 id 对应模型类别序号, 但上层一律按类名查 (d.name / engine.class_names),
+        # 所以这里以「模型类名」为键: 条目里的 name 优先, 否则用模型第 id 个类名。
+        # (旧实现直接拿 id 当键, 字符串查整数键永远查不到 -> 元数据全部失效)
+        _names = list(getattr(self.engine, "class_names", []) or [])
+        self.class_meta: Dict[str, dict] = {}
+        for c in self.meta.get("classes", []):
+            i = c.get("id")
+            name = c.get("name") or (_names[i] if isinstance(i, int) and 0 <= i < len(_names) else None)
+            if name:
+                self.class_meta[name] = c
         self.refine = bool(det_cfg.get("refine", True)) if refine is None else refine
         self.decode_qr_enabled = bool(det_cfg.get("decode_qr", True))
         self.parallax_factor = float(det_cfg.get("parallax_factor", 0.6))

@@ -14,138 +14,161 @@
   "classes": [
     {
       "id": 0,
+      "name": "红色镂空立方体",
       "shape_cn": "hollow_cube",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 1,
-      "shape_cn": "penta_prism",
+      "name": "黄色三棱柱",
+      "shape_cn": "tri_prism",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 2,
+      "name": "灰色半球",
       "shape_cn": "hemisphere",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 3,
+      "name": "蓝色圆锥",
       "shape_cn": "cone",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 4,
+      "name": "蓝色五棱柱",
       "shape_cn": "penta_prism",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 5,
+      "name": "黄色圆锥",
       "shape_cn": "cone",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 6,
+      "name": "黄色半球",
       "shape_cn": "hemisphere",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 7,
+      "name": "黄色四面体",
       "shape_cn": "tetrahedron",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 8,
+      "name": "白色圆柱",
       "shape_cn": "cylinder",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 9,
+      "name": "红色半球",
       "shape_cn": "hemisphere",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 10,
+      "name": "红色四面体",
       "shape_cn": "tetrahedron",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 11,
+      "name": "红色五棱柱",
       "shape_cn": "penta_prism",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 12,
+      "name": "白色五棱柱",
       "shape_cn": "penta_prism",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 13,
+      "name": "白色圆锥",
       "shape_cn": "cone",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 14,
+      "name": "红色圆柱",
       "shape_cn": "cylinder",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 15,
+      "name": "白色三棱柱",
       "shape_cn": "tri_prism",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 16,
+      "name": "灰色圆柱",
       "shape_cn": "cylinder",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 17,
+      "name": "蓝色半球",
       "shape_cn": "hemisphere",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 18,
+      "name": "蓝色四面体",
       "shape_cn": "tetrahedron",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 19,
+      "name": "红色三棱柱",
       "shape_cn": "tri_prism",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 20,
+      "name": "白色镂空立方体",
       "shape_cn": "hollow_cube",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 21,
+      "name": "灰色三棱柱",
       "shape_cn": "tri_prism",
       "color": null,
       "height_mm": 30
     },
     {
       "id": 22,
+      "name": "白色四面体",
       "shape_cn": "tetrahedron",
       "color": null,
       "height_mm": 30
