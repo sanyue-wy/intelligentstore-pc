@@ -40,6 +40,18 @@ color_calib.py  现场 HSV 采样 -> 颜色区间        config.py  配置加载
 
 **固定托盘（可选）**：`calib_config.json` 的 `tray.fixed_px` 填托盘内框在画面里的像素位置（画面左上角为原点，x 右 y 下：`{"corners":[4点]}`，相机正对时也可用 `{"x","y","w","h"}`，加 `image_size`），就不再自动检测。**相机斜看（托盘在画面里是梯形）必须给四角**：网页托盘页「点四角」（可自动吸附到白色边缘 = 壁顶内沿，`fixed_z_mm` 自动取壁高），或 `tools/set_tray_fixed.py --corners`。`tray.origin_mm` 给出托盘原点在机械臂坐标系里的位置（无参考点时生效）。
 
+**托盘坐标 → 机械臂坐标**（`robot = R·tray + t`，这是唯一会丢信息的一步）：
+
+- 视觉只算得出「货物在托盘里哪儿」，算不出「托盘摆在世界哪儿」。`R` 来自 `axes`（或用 ≥2 个参考点自动求），`t` 来自 `origin_mm`（或用 1 个参考点反算）。
+- **两个都不给**时 `t` 按 0 处理，所有点整体偏移一个未知向量——相对位置对、绝对位置错，机械臂会抓空。自检会报「没有参考点也没有 origin_mm」。
+- `axes` 写法：`[机械臂+X 对应托盘哪个方向, 机械臂+Y 对应托盘哪个方向]`。托盘方向约定为**画面右 = tray_x、画面下 = tray_y**。
+  例：托盘左上内角在机械臂 (0,190)、画面向右 Y 减小、画面向下 X 增大 → `axes: ["tray_y", "-tray_x"]`、`origin_mm: [0, 190]`。
+  验算：托盘 (100,0) → (0,90)，托盘 (0,50) → (50,190)。
+- 参考点 ≥2 个时 `R` 自动求解，还能查出镜像和比例（偏离 1 超过 3% 说明尺寸或坐标填错）；≥5 / ≥9 个再加残差多项式修正。
+
+**镜头高 `cam_height_mm`**：镜头光心到**托盘底面**的垂直高度（mm），量竖直距离，不是到托盘边缘的斜距。它有两个用途：反推焦距求相机位姿；求不出位姿时做径向视差校正。
+反推出的镜头高和填写值**相差超过 15%** 时 `estimate_pose` 返回失败，`pixel_to_tray/pixel_to_robot` 退回平面单应，自检会报出原因和「最接近的可达值」。这时优先怀疑：四角没点在同一高度、内框 W/H 填反、或广角镜头没做畸变校正。
+
 **透视 / 斜看相机（`tray.perspective`，默认 auto）**：托盘四角单应 + 焦距 → 相机位姿（倾角、镜头高）。高度 h 处的像点按 `像素 = K[r1 r2 t+h·n][x y 1]ᵀ` 投回托盘坐标，与倾角无关；旧公式 `p' = c + (p-c)(1-h/H)` 只在光轴垂直托盘时成立（倾 25° 时 18mm 高的点偏约 8mm，新方法 <0.1mm，合成数据）。焦距来源：`tray.focal_px` > 棋盘格完整标定 > `cam_height_mm` 反推 > 托盘四角自估（倾角 ≥12°）；都没有时退回旧公式。状态里 `perspective` 字段给出方法、倾角、估计镜头高。自动检测模式下梯形托盘的长宽比校验也会自动放宽。
 
 **自动 ROI**：没有手动设 `detect.roi` 时，用托盘内框外扩 6mm 作 ROI，托盘外的误检直接丢弃。
@@ -89,12 +101,13 @@ color_calib.py  现场 HSV 采样 -> 颜色区间        config.py  配置加载
 |---|---|
 | `enabled, inner_w_mm, inner_h_mm` | 托盘模式开关与内框尺寸（必填） |
 | `rim_mm, rim_height_mm` | 白色外边界到内框距离、壁顶高度 |
-| `axes` | 机械臂 +X/+Y 对应 `tray_x / -tray_x / tray_y / -tray_y` |
-| `ref_points` | `[{"tray_mm":[x,y], "robot_mm":[x,y]}]` |
+| `axes` | 机械臂 +X/+Y 对应 `tray_x / -tray_x / tray_y / -tray_y`（画面右 = tray_x，画面下 = tray_y） |
+| `origin_mm` | 托盘原点（画面左上内角）在机械臂坐标系里的位置；无参考点时它就是 `t` |
+| `ref_points` | `[{"tray_mm":[x,y], "robot_mm":[x,y]}]`，≥2 个自动求旋转 |
 | `residual` | `auto`（默认）/ `none` |
 | `white_s_max, white_v_min, aspect_tol, jump_px, confirm` | 检测与跟踪参数，一般不用动 |
 | `auto_roi, roi_margin_mm` | 托盘内框自动作 ROI |
-顶层还有 `cam_height_mm`、`camera_matrix`、`dist_coeffs`、`image_size`（换分辨率后自检报警）。
+顶层还有 `cam_height_mm`（镜头光心到托盘底面的垂直高度）、`camera_matrix`、`dist_coeffs`、`image_size`（换分辨率后自检报警）。
 
 ## 7. classes.json
 - `classes` 顺序 = 模型类别顺序，`./convert.sh` 自动按模型重排；新类别要补 `shape_cn`（中文名）和 `height_mm`。
