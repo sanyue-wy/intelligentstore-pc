@@ -181,8 +181,9 @@ class CommDebug:
             "storage_step": lambda: c.send_storage_step(bool(body.get("ccw", True))),
             "storage_slot": lambda: c.send_storage_slot(slot),
             "poll": lambda: c.send_poll(),
-            "move": lambda: c.send_move(int(body.get("tid") or 201), x, y,
-                                        timeout_ms=int(body.get("timeout_ms") or 10000)),
+            "move": lambda: c.send_move(int(body.get("tid") or 0), x, y,
+                                        timeout_ms=int(body.get("timeout_ms") or 10000),
+                                        wait_ack=False),
         }
         fn = table.get(cmd)
         if not fn:

@@ -67,9 +67,10 @@ _COMM_BODY = """
       <button class="btn sm" onclick="send('storage_slot',{slot:+$('slot').value})">GOTO_SLOT</button>
       <button class="btn sm" onclick="send('storage_step',{ccw:true})">步进 CCW</button>
       <button class="btn sm" onclick="send('storage_step',{ccw:false})">步进 CW</button></div>
-    <div class="row"><label>运动到 x,y</label><input id="mx" value="0" style="width:76px">
-      <input id="my" value="0" style="width:76px">
-      <button class="btn sm" onclick="send('move',{x:+$('mx').value,y:+$('my').value})">MOVE</button></div>
+    <div class="row"><label>点动 x,y (mm)</label><input id="mx" type="number" step="0.1" value="0" style="width:76px">
+      <input id="my" type="number" step="0.1" value="0" style="width:76px">
+      <button class="btn sm" onclick="move()">MOVE</button>
+      <span class="muted">task_id=0 纯点动 · 绝对坐标</span></div>
     <div class="row muted">状态帧包含 state / busy / estop / alarm / res_flags / pick_ready / 当前坐标 / 储物盘槽位。</div>
   </div>
 </div>
@@ -106,6 +107,13 @@ function renderLog(logs){
 async function conn(){let d=await post('/api/comm/connect',{port:$('port').value,baudrate:+$('baud').value});toast(d.ok?'连接成功':'连接失败: '+(d.error||''),d.ok);refresh()}
 async function mock(){let d=await post('/api/comm/mock');toast(d.ok?'已用 MockSTM32 模拟':'失败: '+(d.error||''),d.ok);refresh()}
 async function disc(){let d=await post('/api/comm/disconnect');toast(d.ok?'已断开':'失败',d.ok);refresh()}
+async function move(){
+  let x=+$('mx').value, y=+$('my').value;
+  if(!isFinite(x)||!isFinite(y)){toast('坐标必须是数字',false);return;}
+  if(!confirm2('确认点动到绝对坐标 '+x+','+y+' mm ?'))return;
+  let d=await post('/api/comm/send',{cmd:'move',x:x,y:y});
+  toast('点动'+(d.ok?' 已发送':' 失败'+(d.error?' ('+d.error+')':'')),d.ok);refresh();
+}
 async function send(cmd,extra){
   if(cmd!='estop'&&['move','storage_slot','storage_step','tray_shake','tray_home','grip_close','z_down'].includes(cmd)){
     if(!confirm2('确认发送 '+cmd+' ?'))return;
