@@ -63,3 +63,13 @@ PERMIT      ──▶ 下潜夹取 ─▶ 运送 ─▶ 放置 ─▶ 归位 ─
 | 变量 | 说明 |
 |---|---|
 | `STM_PORT` | 指定串口，如 `/dev/ttyACM0`；缺省自动发现 |
+
+
+## 兼容兜底：固件不上报 RES_FLAGS.PICK 时（方案B）
+`execute_sorting_task_ex` 增加"运动到位即发许可"的兜底：若固件（如 app.c 业务层）到达取件位后不置
+`RES_FLAGS bit2 (PICK=0x04)`，上位机会在机械臂运动到目标附近（默认 ≤ `PERMIT_ARRIVE_TOL_MM`=5mm）并
+连续稳定 `PERMIT_STABLE_S`（默认 1.0s）后，主动视为到位并下发 `PERMIT`，从而兼容新旧固件。
+- 关闭：`PERMIT_FALLBACK=0`
+- 调容差：`PERMIT_ARRIVE_TOL_MM`（mm）
+- 调稳定判定：`PERMIT_STABLE_S`；最小耗时：`PERMIT_MIN_ELAPSED_S`
+报警/急停/有 error 锁存时不会兜底发许可。单测见 `communication/test_permit_fallback.py`。

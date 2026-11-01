@@ -71,3 +71,9 @@
 - **未删死代码误报**：`communication/client.py` 的 `_waiting_ack_seq / _ack_event` 经核查**仍在用**
   （`_wait_and_ack` 与 `_handle_status` 中真实读写），不是死代码，故保留、不改逻辑。
 - 文档同步：`README.md`、`MODULES.md`、各 `GUIDE.md`、`deploy/OPERATIONS.md` 去除指向已删文件的段落。
+
+
+## 重构记录(阶段4) — 方案B 上位机 PERMIT 兼容兜底
+- 背景：新固件把运动/抓取交给 `User/APP/app.c` 业务层，到达取件位后只停在"等 PERMIT"，**不再置 `RES_FLAGS bit2 (PICK=0x04)`**；旧版上位机 `execute_sorting_task_ex` 死等 0x04 必然 12s 超时。
+- 改动：`communication/client.py` 在等待到达取件位的循环中新增兜底——机械臂运动到目标附近（默认5mm）并稳定一段时间（默认1s）即视为到位并下发 `PERMIT`；报警/急停/有 error 锁存时绝不误发。可用 `PERMIT_FALLBACK=0` 关闭。逻辑仅新增、不改原有 PICK 路径（固件修好后仍走原生路径）。
+- 测试：`communication/test_permit_fallback.py` 5 用例（兜底生效/关闭超时/故障不误发/目标远不误发/原生PICK回归）；全套 70 用例 OK。

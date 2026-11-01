@@ -824,6 +824,26 @@ class IntelligentSortingClient(SortingClientBase):
         # 3. 跟踪运行并等待到达取件位 (RES_PICK 或 WAIT_PERMIT)
         report("机械臂前往取件位中...", 25)
         reached_pick = False
+        # --- 方案B 兼容兜底: app.c 类固件不置 RES_FLAGS.PICK 时按"运动到位"判据发 PERMIT ---
+        # 新固件把运动/抓取交给 app.c 业务层, 到达取件位后只停在"等 PERMIT", 不再置 0x04;
+        # 若上位机死等 0x04 必然超时。这里用"位置已到目标附近且连续稳定一段时间"作为到达判据主动发许可。
+        # 环境变量: PERMIT_FALLBACK=0 关闭; PERMIT_ARRIVE_TOL_MM(默认5.0); PERMIT_STABLE_S(默认1.0); PERMIT_MIN_ELAPSED_S(默认0.5)
+        _pf_env = os.environ.get("PERMIT_FALLBACK", "1").strip().lower()
+        _pf_on = _pf_env not in ("0", "false", "no", "off", "")
+        try:
+            _pf_tol = float(os.environ.get("PERMIT_ARRIVE_TOL_MM", "5.0") or 5.0)
+        except ValueError:
+            _pf_tol = 5.0
+        try:
+            _pf_stable = float(os.environ.get("PERMIT_STABLE_S", "1.0") or 1.0)
+        except ValueError:
+            _pf_stable = 1.0
+        try:
+            _pf_min = float(os.environ.get("PERMIT_MIN_ELAPSED_S", "0.5") or 0.5)
+        except ValueError:
+            _pf_min = 0.5
+        _pf_since = None
+        _pf_announced = False
         while time.time() - start_time < timeout_s:
             if cancel_token and cancel_token():
                 report("上位机取消任务！", 0)
@@ -864,6 +884,27 @@ class IntelligentSortingClient(SortingClientBase):
                 if st.is_permit_required:
                     reached_pick = True
                     break
+
+                # 方案B: 固件未上报 PICK, 但机械臂已运动到目标附近并稳定 → 视作到达, 主动发 PERMIT
+                if _pf_on and not st.is_task_done:
+                    _state_ok = st.state in (SysState.RUNNING, SysState.BUSY, SysState.IDLE)
+                    if _state_ok and not st.is_estop and not st.is_alarm and int(st.error) == 0:
+                        _near = (abs(float(st.cur_x_mm) - float(target_x_mm)) <= _pf_tol and
+                                 abs(float(st.cur_y_mm) - float(target_y_mm)) <= _pf_tol)
+                        _now = time.time()
+                        if _near:
+                            if _pf_since is None:
+                                _pf_since = _now
+                            if (_now - _pf_since) >= _pf_stable and (_now - start_time) >= _pf_min:
+                                if not _pf_announced:
+                                    report("固件未上报 PICK 位, 已按运动到位判定发许可(方案B兜底)", 42)
+                                    logger.info("[Client] PERMIT fallback: pos=(%.1f,%.1f) target=(%.1f,%.1f) after %.2fs",
+                                                st.cur_x_mm, st.cur_y_mm, target_x_mm, target_y_mm, _now - start_time)
+                                    _pf_announced = True
+                                reached_pick = True
+                                break
+                        else:
+                            _pf_since = None
 
                 pct = min(40, max(25, int(st.progress)))
                 report(f"移动中... 当前位置 ({st.cur_x_mm:.1f}, {st.cur_y_mm:.1f})", pct)
