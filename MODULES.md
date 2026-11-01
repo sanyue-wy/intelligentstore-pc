@@ -36,3 +36,19 @@
   调试台替代、阶段 3 整体删除，提前打平只会制造无谓改动。
 - `communication/`、`UI/` 的逻辑代码按总原则"行为不变"**不做**微重构（深层嵌套/早期返回等），
   以免破坏已与真机调通的字节级/时序级行为。
+
+
+## 重构记录（阶段 2：统一网页，逻辑不变）
+
+- 新增 `webui/` 包（纯标准库，无 Node/CDN）：`base.py`（口令校验、静态文件安全读取、MIME）、
+  `pages.py`（四节页面骨架）、`comm_debug.py`（串口发现/连接/模拟 + 各命令发送 + 收发日志）、
+  `flow_debug.py`（扫描→规划→单步执行一件→抖料→复位，与比赛共用 `SorterPlanner`/`CompetitionController`）、
+  `screen.py`（全屏只读大屏页）、`static/app.css` + `static/common.js`（全站统一样式/工具）、`test_webui.py`。
+- `tools/vision_tool.py` 的 `cmd_web` 就地升级为**统一调试台 :8090**：保留原有全部视觉调参 API/页面逻辑不动，
+  仅在页面顶部加统一导航条（视觉调试/流程调试/通讯调试/完整调试/大屏预览），并挂载新增的
+  `/comm`、`/flow`、`/run` 页面与 `/api/comm/*`、`/api/flow/*`、`/api/run/*` 接口；同一进程、同一口令、同一 `svc`。
+- 比赛执行页 `UI/run_page.py`（:8088）接入共享样式与红橙「比赛模式」顶栏，新增 `/screen`（全屏只读）
+  与 `/static/<name>`；`开始/停止本轮/急停/一键重启/刷新自检` 与 `state_dict`/`frame_jpeg`/`screen_png`/`request`
+  逻辑**未改**。详见 `WEB_CONSOLE.md`。
+- `debug/` 下 Tk 调试器仍未删除（阶段 3 处理）；`communication/`、`UI/run_competition.py` 状态机
+  与看门狗行为**未改**。

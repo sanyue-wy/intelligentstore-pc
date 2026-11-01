@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 
 HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>智能分拣 · 执行页</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/static/app.css">
 <style>
 body{font-family:"Microsoft YaHei",sans-serif;background:#10141c;color:#dde;margin:0}
 header{display:flex;align-items:center;gap:16px;padding:10px 16px;background:#18202c}
@@ -44,8 +44,8 @@ img{max-width:100%;border-radius:4px}
 table{border-collapse:collapse;width:100%;font-size:13px}td,th{border-bottom:1px solid #2a3444;padding:3px 5px;text-align:left}
 .ok{color:#3d8}.warn{color:#fb3}.err{color:#f55}.mono{font-family:monospace;font-size:12px}
 #events{max-height:230px;overflow:auto}#msg{color:#fb3}
-</style></head><body>
-<header><span id="state" class="standby">--</span><span id="timer">0.0s</span><span id="done">0 件</span>
+</style></head><body class="is-competition">
+<header><span id="state" class="standby">--</span><span id="timer">0.0s</span><span id="done">0 件</span><span class="badge compet">比赛模式</span>
 <span style="flex:1"></span>
 <button id="bstart" onclick="act('start')">开始</button>
 <button id="bstop" onclick="if(confirm('停止本轮, 回到待机?'))act('stop')">停止本轮</button>
@@ -123,6 +123,14 @@ class RunPage:
                     elif p == "/screen.png":
                         b = app.screen_png()
                         self._send(b, "image/png") if b else self.send_error(404)
+                    elif p == "/screen":
+                        from webui.screen import SCREEN_HTML
+                        self._send(SCREEN_HTML.encode(), "text/html; charset=utf-8")
+                    elif p.startswith("/static/"):
+                        from webui.base import read_static, guess_type
+                        name = p.rsplit("/", 1)[-1]
+                        b = read_static(name)
+                        self._send(b, guess_type(name)) if b else self.send_error(404)
                     else:
                         self.send_error(404)
                 except (BrokenPipeError, ConnectionResetError):

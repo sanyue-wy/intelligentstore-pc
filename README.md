@@ -8,7 +8,7 @@
 # 板子上 (宿主, 工程目录内)
 sudo deploy/bpu_doctor.sh            # 1. 诊断 BPU / 容器 (第一次或系统升级后)
 sudo ./is.sh migrate                 # 2. 建 ubuntu:22.04 容器并挂载宿主 BPU 库 (一次性)
-./is.sh web --arm                    # 3. 浏览器 http://<板子IP>:8090 : 托盘 / 畸变 / 颜色 / 相机 / 标定 全部在这里调
+./is.sh web --arm                    # 3. 浏览器 http://<板子IP>:8090 : 统一调试台四节：视觉(托盘/畸变/颜色/相机/标定) + 流程单步 + 串口调试 + 全流程演练
 ./convert.sh --setup-remote 用户@笔记本IP   # 4. 一次性: 笔记本 WSL 作为 BPU 模型编译机
 cp best.pt vision/models/ && ./convert.sh  # 5. 换模型: 一条命令 .pt -> ONNX -> BPU .bin
 ./is.sh precheck                     # 6. 赛前自检
@@ -59,10 +59,10 @@ cp best.pt vision/models/ && ./convert.sh  # 5. 换模型: 一条命令 .pt -> O
 | 监控 | `moniter/GUIDE.md` | 心跳看门狗、资源、告警 |
 | 工具 | `tools/GUIDE.md` | `./convert.sh` 一键转模型、浏览器调参台、标定、训练 |
 | 部署运维 | `deploy/OPERATIONS.md` | 容器、BPU 挂载、systemd、日志、故障速查 |
-| 调试界面 | `debug/README.md` | Tk 工作台 |
+| 调试界面 | `WEB_CONSOLE.md` | 统一网页调试台 :8090 (视觉/流程/通讯/完整) + 比赛执行页 :8088 |
 | 接口索引 | `MODULES.md` | 每个模块的契约文件和约定 |
 
-## 4. 现场调参顺序（全部在浏览器 :8090）
+## 4. 现场调参顺序（全部在浏览器 :8090 统一调试台）
 
 1. **相机页**：锁曝光、增益、白平衡 → 应用并保存。
 2. **畸变页**：打印 A4 棋盘格平铺在托盘上 → 「一键校正」（单张即可，缩放无所谓，可叠加 2~3 张）。完整多角度标定在折叠项里，一般不需要。
@@ -99,7 +99,7 @@ records/        运行时生成: scans/(每次扫描) runs/(每轮报告)
 ## 7. 测试
 
 ```bash
-for m in vision.test_vision MessegeCenter.test_bus moniter.test_monitor communication.test_comm UI.test_ui; do python3 -m unittest $m; done
+for m in vision.test_vision MessegeCenter.test_bus moniter.test_monitor communication.test_comm UI.test_ui webui.test_webui; do python3 -m unittest $m; done
 ALLOW_MOCK=1 USE_SYNTHETIC_CAM=1 START_SOURCES=auto ONESHOT=1 EXPECTED_TOTAL=3 python3 UI/run_competition.py   # 无硬件全流程
 ```
 

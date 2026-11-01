@@ -243,7 +243,7 @@ LOGIN_HTML = """<!doctype html><meta charset=utf-8><meta name=viewport content="
 <input id=t autofocus inputmode=numeric style="font-size:1.4em;width:8em"> <button style="font-size:1.2em">进入</button></form>"""
 
 
-HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>视觉调试台</title>
+HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>智能分拣调试台 · 视觉</title><link rel="stylesheet" href="/static/app.css">
 <style>body{font-family:"Microsoft YaHei",sans-serif;background:#1e1e24;color:#ddd;margin:0;display:flex}
 #l{padding:8px}#r{padding:8px;flex:1;font-size:13px;max-width:560px}img{border:1px solid #555}#v{cursor:crosshair}
 button{margin:2px;padding:6px 10px;background:#335;color:#fff;border:0;border-radius:4px;cursor:pointer}
@@ -251,7 +251,7 @@ button.on{background:#a60}table{border-collapse:collapse}td,th{border:1px solid 
 pre{white-space:pre-wrap;background:#111;padding:6px;max-height:200px;overflow:auto}.bad{color:#f66}.ok{color:#3d8}.hint{color:#fa4}
 .tabs button{background:#223}.tabs button.on{background:#a60}.pane{display:none}.pane.on{display:block}.dim{opacity:.6}
 input[type=range]{width:220px}#msg{color:#fb3;min-height:18px}.thumb{width:160px;cursor:pointer}</style></head>
-<body><div id="l"><img id="v" src="/stream"><br>
+<body><style>.isnav{position:fixed;top:0;left:0;right:0;height:36px;background:#12161e;display:flex;align-items:center;gap:4px;padding:0 10px;z-index:999;border-bottom:1px solid #2a3444;font-family:"Microsoft YaHei",sans-serif}.isnav a{color:#9aa7b8;text-decoration:none;padding:7px 12px;border-radius:6px;font-size:14px}.isnav a:hover{background:#26303f;color:#fff}.isnav a.on{background:#2f6fdf;color:#fff}.isnav .sp{flex:1}.isnav .bdg{font-size:12px;color:#8fa6c6;border:1px solid #34435c;border-radius:10px;padding:2px 8px}body{padding-top:40px}</style><div class="isnav"><span style="color:#fff;font-weight:700;margin-right:10px">智能分拣调试台</span><a href="/" class="on">视觉调试</a><a href="/flow">流程调试</a><a href="/comm">通讯调试</a><a href="/run">完整调试</a><span class="sp"></span><span class="bdg">调试模式 · 非比赛</span><a href="/screen.png" target="_blank">大屏预览</a></div><div id="l"><img id="v" src="/stream"><br>
 <button onclick="scan()">Scan (比赛同款)</button><button onclick="snap()">Snap 存原图</button>
 置信度 <input type="range" min="5" max="95" value="40" id="conf" oninput="setconf(this.value)" style="width:120px"> <span id="cv">0.40</span>
 <div id="msg"></div><div id="tb"></div></div>
@@ -423,6 +423,25 @@ def cmd_web(args):
                 log.warning("下位机连接失败, 标定坐标需手动输入")
         except Exception as e:
             log.warning("下位机不可用: %s", e)
+
+    # ---- 统一网页附加章节: 通讯调试 / 流程调试 / 完整过程调试 (webui 包) ----
+    _wpages = None
+    _webui_comm = None
+    _webui_flow = None
+    try:
+        from webui import pages as _wpages
+        from webui.comm_debug import CommDebug
+        from webui.flow_debug import FlowDebug
+        from communication import create_comm_client as _mk_client
+        try:
+            _shared_client = _mk_client()
+        except Exception:
+            _shared_client = None
+        _webui_comm = CommDebug(_shared_client)
+        _webui_flow = FlowDebug(svc=svc, client=_shared_client, target_to_dict=t2d)
+        log.info("调试台附加章节已就绪: 流程 / 通讯 / 完整过程")
+    except Exception as e:
+        log.warning("调试台附加章节不可用: %s", e)
 
     def goto(u, v, h=0.0):
         c = arm["client"]
@@ -893,6 +912,30 @@ def cmd_web(args):
                     self._send(open(p, "rb").read(), "image/jpeg")
                 else:
                     self.send_error(404)
+            elif u.path in ("/static/app.css", "/static/common.js"):
+                from webui.base import read_static, guess_type
+                name = u.path.rsplit("/", 1)[-1]
+                b = read_static(name)
+                if b is None:
+                    self.send_error(404)
+                else:
+                    self._send(b, guess_type(name))
+            elif _webui_comm is not None and u.path in ("/comm", "/flow", "/run"):
+                h = _wpages.page(u.path)
+                if h:
+                    self._send(h.encode(), "text/html; charset=utf-8")
+                else:
+                    self.send_error(404)
+            elif _webui_comm is not None and u.path == "/api/comm/state":
+                self._json(_webui_comm.snapshot())
+            elif _webui_comm is not None and u.path == "/api/comm/ports":
+                self._json({"ports": _webui_comm.list_ports()})
+            elif _webui_flow is not None and u.path == "/api/flow/state":
+                self._json(_webui_flow.snapshot())
+            elif _webui_flow is not None and u.path == "/api/run/state":
+                d = _webui_flow.snapshot()
+                d["running"] = _webui_flow.running()
+                self._json(d)
             else:
                 self.send_error(404)
 
@@ -964,6 +1007,32 @@ def cmd_web(args):
                 self._json(view)
             elif u == "/api/regress/add":
                 self._json(regress_add(self._body()))
+            elif _webui_comm is not None and u == "/api/comm/connect":
+                self._json(_webui_comm.connect(self._body()))
+            elif _webui_comm is not None and u == "/api/comm/mock":
+                self._json(_webui_comm.connect_mock())
+            elif _webui_comm is not None and u == "/api/comm/disconnect":
+                self._json(_webui_comm.disconnect())
+            elif _webui_comm is not None and u == "/api/comm/send":
+                self._json(_webui_comm.send(self._body()))
+            elif _webui_flow is not None and u == "/api/flow/scan":
+                self._json(_webui_flow.scan())
+            elif _webui_flow is not None and u == "/api/flow/plan":
+                self._json(_webui_flow.plan())
+            elif _webui_flow is not None and u == "/api/flow/exec":
+                self._json(_webui_flow.exec_one(self._body()))
+            elif _webui_flow is not None and u == "/api/flow/shake":
+                self._json(_webui_flow.shake())
+            elif _webui_flow is not None and u == "/api/flow/reset":
+                self._json(_webui_flow.reset())
+            elif _webui_flow is not None and u == "/api/run/start":
+                self._json(_webui_flow.start_full(self._body()))
+            elif _webui_flow is not None and u == "/api/run/stop":
+                self._json(_webui_flow.stop_full())
+            elif _webui_flow is not None and u == "/api/run/estop":
+                c = _webui_flow.client
+                self._json({"ok": bool(c and getattr(c, "is_connected", False) and c.send_estop())}
+                           if (c and getattr(c, "is_connected", False)) else {"ok": False, "error": "未连接"})
             else:
                 self.send_error(404)
 

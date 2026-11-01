@@ -1,0 +1,100 @@
+/* 智能分拣上位机 —— 公共网页样式 (调试台 / 比赛执行页共用)
+   纯 CSS, 无外部依赖。适配 1366x768 笔记本。 */
+:root {
+  --bg: #10141c;
+  --panel: #18202c;
+  --panel2: #1e2735;
+  --line: #2a3444;
+  --fg: #dde3ee;
+  --muted: #8a97ab;
+  --accent: #2f6fdf;
+  --primary: #1f7a45;
+  --danger: #c62828;
+  --warn: #d98a1f;
+  --ok: #35c46b;
+}
+* { box-sizing: border-box; }
+body { font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  background: var(--bg); color: var(--fg); margin: 0; font-size: 14px; }
+a { color: #8cc2ff; text-decoration: none; }
+
+/* ---- 顶部导航 ---- */
+.topnav { display: flex; align-items: center; gap: 6px; padding: 8px 14px;
+  background: linear-gradient(90deg, #141a24, #1b2534); border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 50; }
+.topnav .brand { font-weight: 700; font-size: 15px; color: #fff; margin-right: 12px; letter-spacing: .5px; }
+.topnav a { color: var(--muted); padding: 7px 13px; border-radius: 6px; font-size: 14px; }
+.topnav a:hover { background: #26303f; color: #fff; }
+.topnav a.on { background: var(--accent); color: #fff; }
+.topnav .spacer { flex: 1; }
+.badge { font-size: 12px; padding: 3px 9px; border-radius: 10px; border: 1px solid var(--line); color: var(--muted); }
+.badge.dbg { border-color: #3b4a61; color: #9fb6d6; }
+.badge.compet { background: #7a1414; color: #fff; border-color: #a52a2a; }
+.badge.ok { color: #0d0; border-color: #1a5; }
+.badge.bad { color: #f66; border-color: #a33; }
+
+/* ---- 布局 ---- */
+.page { padding: 12px 14px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+@media (max-width: 1100px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 9px; padding: 12px; }
+.card h3 { margin: 0 0 9px 0; font-size: 14px; color: #9ab; font-weight: 600; }
+.card h3 .sub { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 6px; }
+
+/* ---- 表单 ---- */
+.row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
+.row label { color: var(--muted); }
+input, select { background: #0e131b; color: var(--fg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 8px; font-size: 13px; }
+input:focus, select:focus { outline: none; border-color: var(--accent); }
+input[type=checkbox] { width: 16px; height: 16px; vertical-align: middle; }
+
+/* ---- 按钮 ---- */
+.btn { background: #2a3446; color: #fff; border: 0; border-radius: 7px; padding: 8px 14px;
+  font-size: 14px; cursor: pointer; }
+.btn:hover { filter: brightness(1.12); }
+.btn:disabled { opacity: .35; cursor: not-allowed; }
+.btn.primary { background: var(--primary); }
+.btn.danger { background: var(--danger); }
+.btn.warn { background: var(--warn); }
+.btn.ghost { background: transparent; border: 1px solid var(--line); }
+.btn.sm { padding: 4px 9px; font-size: 12px; }
+
+/* ---- 状态徽标 ---- */
+.stat { display: inline-block; padding: 2px 8px; border-radius: 5px; font-size: 12px; }
+.stat.ok { background: #123a24; color: var(--ok); }
+.stat.bad { background: #3a1414; color: #f66; }
+.stat.warn { background: #3a2e12; color: var(--warn); }
+.stat.idle { background: #232c3a; color: var(--muted); }
+
+/* ---- 表格 ---- */
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+td, th { border-bottom: 1px solid var(--line); padding: 4px 6px; text-align: left; }
+th { color: var(--muted); font-weight: 500; }
+
+/* ---- 日志 ---- */
+.log { background: #0a0e14; border: 1px solid var(--line); border-radius: 6px; padding: 8px;
+  font-family: ui-monospace, Consolas, monospace; font-size: 12px; height: 260px; overflow: auto;
+  white-space: pre-wrap; word-break: break-all; }
+.log .tx { color: #7fd0ff; }
+.log .rx { color: #9ef0a0; }
+.log .ev { color: #d9c07a; }
+.mono { font-family: ui-monospace, Consolas, monospace; }
+.muted { color: var(--muted); }
+.ok { color: var(--ok); }
+.bad { color: #f66; }
+.warn { color: var(--warn); }
+
+/* ---- toast ---- */
+.toast { position: fixed; right: 18px; bottom: 18px; background: #22303f; color: #fff;
+  border-left: 4px solid var(--accent); padding: 10px 14px; border-radius: 6px; z-index: 9999;
+  box-shadow: 0 4px 18px rgba(0,0,0,.4); font-size: 13px; }
+.toast.ok { border-left-color: var(--ok); }
+.toast.bad { border-left-color: var(--danger); }
+
+/* ---- 比赛执行页: 红/橙顶栏, 现场一眼区分调试台 ---- */
+body.is-competition header { background: linear-gradient(90deg, #5c1414, #8a2d00) !important;
+  border-bottom: 3px solid #d33; }
+body.is-competition { border-top: 4px solid #d33; }
