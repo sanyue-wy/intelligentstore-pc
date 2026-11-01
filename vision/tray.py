@@ -464,36 +464,48 @@ def _focal_from_height(solve, f0: float, target_mm: float,
 
     高度对焦距**不是单调的**: 四个共面点 + 已知光心时平面位姿有两种解 (经典二义性),
     高度曲线是单峰的 (先升后降), 单调二分会在两端夹死并给出相差数倍的"解"。
-    所以先在对数网格上粗扫, 找到最接近目标的分支, 再在邻域内黄金分割细化。
+    做法: 对数网格粗扫定位峰值, 在峰值左右两支各做黄金分割细化; 两支都落在容差内时
+    取**倾角更小**的那支 (相机更接近正对, 也是旧二分实现的结果, 保持坐标不变)。
     返回 (f, 是否落在容差内, 该 f 下的高度)。
     """
     lo, hi = 0.15 * f0, 8.0 * f0
-    fs = np.geomspace(lo, hi, 96)
+    n = 96
+    fs = np.geomspace(lo, hi, n)
     hs = np.array([solve(float(f))["height_mm"] for f in fs], np.float64)
-    i = int(np.argmin(np.abs(hs - target_mm)))
-    a = float(fs[max(0, i - 1)])
-    b = float(fs[min(len(fs) - 1, i + 1)])
-    if b <= a:
-        a, b = lo, hi
+    ip = int(np.argmax(hs))
     g = (math.sqrt(5) - 1) / 2
 
     def cost(f):
         return abs(solve(float(f))["height_mm"] - target_mm)
 
-    c, d = b - g * (b - a), a + g * (b - a)
-    fc, fd = cost(c), cost(d)
-    for _ in range(48):
-        if fc < fd:
-            b, d, fd = d, c, fc
-            c = b - g * (b - a)
-            fc = cost(c)
-        else:
-            a, c, fc = c, d, fd
-            d = a + g * (b - a)
-            fd = cost(d)
-    f = (a + b) / 2.0
-    h = float(solve(f)["height_mm"])
-    return f, abs(h - target_mm) <= tol * target_mm, h
+    def refine(a: float, b: float) -> float:
+        if b <= a:
+            return (a + b) / 2.0
+        c, d = b - g * (b - a), a + g * (b - a)
+        fc, fd = cost(c), cost(d)
+        for _ in range(48):
+            if fc < fd:
+                b, d, fd = d, c, fc
+                c = b - g * (b - a)
+                fc = cost(c)
+            else:
+                a, c, fc = c, d, fd
+                d = a + g * (b - a)
+                fd = cost(d)
+        return (a + b) / 2.0
+
+    spans = [(float(fs[0]), float(fs[ip])), (float(fs[ip]), float(fs[-1]))]
+    cands = []
+    for a, b in spans:
+        f = refine(a, b)
+        sol = solve(f)
+        cands.append((float(f), float(sol["height_mm"]), float(sol["tilt_deg"])))
+    good = [c for c in cands if abs(c[1] - target_mm) <= tol * target_mm]
+    if good:
+        f, h, _ = min(good, key=lambda c: c[2])
+        return f, True, h
+    f, h, _ = min(cands, key=lambda c: abs(c[1] - target_mm))
+    return f, False, h
 
 
 def estimate_pose(G: np.ndarray, principal: Tuple[float, float], frame_wh: Tuple[int, int],

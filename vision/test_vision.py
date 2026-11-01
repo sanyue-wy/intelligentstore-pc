@@ -479,6 +479,9 @@ class TestPoseValidation(unittest.TestCase):
         self.assertTrue(p["ok"], p.get("msg"))
         self.assertEqual(p["source"], "cam_height")
         self.assertLessEqual(abs(p["height_mm"] - 115.0), 0.15 * 115.0)
+        # 115mm 在这组四角上对应两支解 (f≈396/倾角44° 与 f≈884/倾角65°), 取倾角小的那支,
+        # 否则坐标会悄悄改变 (旧二分实现的结果是 44°)
+        self.assertLess(p["tilt_deg"], 50, f"二义性取错分支: tilt={p['tilt_deg']} f={p['f']}")
 
     def test_height_too_small_is_rejected(self):
         from vision import tray as T
