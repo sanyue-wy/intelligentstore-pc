@@ -104,7 +104,7 @@ ALLOW_MOCK=1 USE_SYNTHETIC_CAM=1 START_SOURCES=auto ONESHOT=1 EXPECTED_TOTAL=3 p
 ```
 
 ## 8. 已知遗留（赛后和固件一起改）
-- 通讯协议：32 字节帧没有 CRC（USB CDC 链路层有校验，风险低）；重发时换新 SEQ，下位机按 SEQ 去重失效，ACK 丢失时命令可能执行两次（比赛路径用绝对槽位 `GOTO_SLOT` 和任务闭环，影响有限；`STEP_CW/CCW` 只在调试里用）；ACK 用 `ack>s && ack-s<500` 模糊匹配。计划：同 SEQ 重发 + 下位机去重时重新回 ACK + RESERVED 字节放 CRC8 + 精确匹配。`client.py` 里 `_waiting_ack_seq/_ack_event` 是没用到的旧 ACK 逻辑。
+- 通讯协议：32 字节帧没有 CRC（USB CDC 链路层有校验，风险低）；重发时换新 SEQ，下位机按 SEQ 去重失效，ACK 丢失时命令可能执行两次（比赛路径用绝对槽位 `GOTO_SLOT` 和任务闭环，影响有限；`STEP_CW/CCW` 只在调试里用）；ACK 用 `ack>s && ack-s<500` 模糊匹配。计划：同 SEQ 重发 + 下位机去重时重新回 ACK + RESERVED 字节放 CRC8 + 精确匹配。`client.py` 的 `_waiting_ack_seq/_ack_event` 经核查是**在用**的 ACK 等待逻辑（`_wait_and_ack` / `_handle_status`），不属于可删死代码。
 - 消息总线默认同步分发，与 `MessegeCenter/interfaces.py` 契约不符（见 `MessegeCenter/GUIDE.md`）。
 - 监控预置了 communication / message_center / coordinator 三个模块，但只有视觉发心跳，比赛程序也没启动 MonitorService：目前只是没覆盖，不会误报。
 - 上层用到的契约外属性：`client.latest_status`、`vision.detector.engine`、`detect_multi/detect_fast`，换后端时要一并实现。
@@ -114,3 +114,9 @@ ALLOW_MOCK=1 USE_SYNTHETIC_CAM=1 START_SOURCES=auto ONESHOT=1 EXPECTED_TOTAL=3 p
 - Windows OpenSSH → WSL `hb_mapper` 编译链路。
 - 海康相机、灯光、白色托盘检测（外围黑边）、GPIO/USB 启动键、物理大屏、机械臂完整闭环。
 - 托盘参考点和点哪去哪误差。
+
+## 10. 重构交付文档
+- `REFACTOR_REPORT.md`：PR 说明（各阶段改动 / 目录树前后对比 / 删除清单 / 测试结果）。
+- `WEB_CONSOLE.md`：统一网页调试台四节用法、启动与 API。
+- `BOARD_UPDATE.md`：上板更新步骤（拉代码 / 保留哪些现场文件 / 重启 / 回滚）。
+- `FIELD_VERIFICATION_CHECKLIST.md`：现场待验证清单（只在仿真测过的部分）。
