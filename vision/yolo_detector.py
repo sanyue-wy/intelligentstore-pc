@@ -82,6 +82,8 @@ class YoloWorkpieceDetector(WorkpieceDetector):
                 self.class_meta[name] = c
         self.refine = bool(det_cfg.get("refine", True)) if refine is None else refine
         self.decode_qr_enabled = bool(det_cfg.get("decode_qr", True))
+        # A1 颜色来源: hsv(默认, HSV 投票为权威) | model(应急: 直接用类名颜色)
+        self.color_source = str((getattr(self.cfg, "color", {}) or {}).get("source", "hsv")).lower()
         self.parallax_factor = float(det_cfg.get("parallax_factor", 0.6))
         self.min_area_px = float(det_cfg.get("min_area_px", 0) or 0)
         self.max_area_px = float(det_cfg.get("max_area_px", 0) or 0)
@@ -94,6 +96,13 @@ class YoloWorkpieceDetector(WorkpieceDetector):
             logger.warning("classes.json 缺少模型类别 %s 的元数据 (中文名/高度), 将按类别名显示", missing)
         if not self._engine_ready():
             logger.warning("YOLO 不可用 (%s), 退回 HSV 颜色检测", self._engine_error())
+
+    def model_color_of(self, class_name: str) -> Optional[str]:
+        """该类在 classes.json 里记录的"训练时颜色" (只读)。
+
+        只用于与 HSV 投票做冲突检测/界面提示, **不参与 category** —— 否则换颜色就得重训。
+        """
+        return (self.class_meta.get(class_name, {}) or {}).get("model_color")
 
     def set_roi(self, polygon):
         """设置托盘 ROI 多边形 (像素)。空列表 = 不限制。"""
@@ -247,14 +256,25 @@ class YoloWorkpieceDetector(WorkpieceDetector):
         if refine:
             u, v, angle, mask = self._refine(frame, x1, y1, x2, y2, (d.cx, d.cy), thin=thin)
 
-        color = meta.get("color") or self._vote_color(frame, x1, y1, x2, y2, mask, thin=thin)
+        # A1 颜色三态: 人为强制(color 非 null) > color.source=model(应急) > HSV 投票(默认权威)。
+        # hsv_color 总是算出来, 用于与 model_color 做冲突检测 (diagnostics)。
+        model_color = meta.get("model_color")
+        hsv_color = self._vote_color(frame, x1, y1, x2, y2, mask, thin=thin)
+        if meta.get("color"):
+            color = meta["color"]
+        elif self.color_source == "model" and model_color:
+            color = model_color
+        else:
+            color = hsv_color
         info = meta.get("info", "") or ""
         if refine and self.decode_qr_enabled and meta.get("decode_qr"):
             qr = self._decode_qr(frame, x1, y1, x2, y2)
             if qr:
                 info = f"{info}:{qr}" if info else qr
 
-        shape = meta.get("shape", d.name)
+        # A1: classes.json 只有 shape_cn; 旧代码 `meta.get("shape", d.name)` 会把「带颜色的
+        # 中文类名」当形状 (现场: 新类别 蓝色半球|red|), category 第一段随模型颜色变化。
+        shape = meta.get("shape_cn") or meta.get("shape") or d.name
         height = float(meta.get("height_mm", 0) or 0)
         cal = self.calibrator
         # 抓取点高度 = 物体高度 × IS_PARALLAX_FACTOR (0.6 约等于上表面的高度带);
@@ -271,7 +291,10 @@ class YoloWorkpieceDetector(WorkpieceDetector):
             u_pixel=round(float(u), 1), v_pixel=round(float(v), 1), x_mm=x_mm, y_mm=y_mm,
             class_name=d.name, label=label, info=info,
             category=f"{shape}|{color}|{info}", bbox=(x1, y1, x2, y2),
-            angle_deg=round(float(angle), 1))
+            angle_deg=round(float(angle), 1),
+            # A1 旁路数据: 模型类名颜色 vs HSV 投票, 由 service 做冲突仲裁 (不影响对外字段)
+            diagnostics={"model_color": model_color, "hsv_color": hsv_color,
+                         "color_source": self.color_source})
 
     def _refine(self, frame, x1, y1, x2, y2, fallback, thin: bool = False):
         """
@@ -393,7 +416,9 @@ class YoloWorkpieceDetector(WorkpieceDetector):
         if self.roi is not None:
             cv2.polylines(vis, [self.roi.astype(np.int32)], True, (0, 200, 255), 1)
         for t in targets:
-            c = _DRAW.get(t.color, (255, 255, 255))
+            # A1: 颜色冲突目标用洋红醒目色 + 文字标「冲突」, 调试台一眼能看到仲裁对象
+            _cf = bool((getattr(t, "diagnostics", None) or {}).get("color_conflict"))
+            c = (255, 0, 255) if _cf else _DRAW.get(t.color, (255, 255, 255))
             if t.bbox:
                 x1, y1, x2, y2 = [int(v) for v in t.bbox]
                 cv2.rectangle(vis, (x1, y1), (x2, y2), c, 2)
@@ -402,6 +427,9 @@ class YoloWorkpieceDetector(WorkpieceDetector):
             u, v = int(t.u_pixel), int(t.v_pixel)
             cv2.drawMarker(vis, (u, v), (255, 255, 255), cv2.MARKER_CROSS, 14, 2)
             txt = f"#{t.target_id} {t.class_name}/{t.color} {t.confidence:.2f} ({t.x_mm:.1f},{t.y_mm:.1f})"
+            if _cf:
+                _d = t.diagnostics or {}
+                txt += f" 冲突 HSV={_d.get('hsv_color')} 类名={_d.get('model_color')}"
             cv2.putText(vis, txt, (x1, max(12, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 3)
             cv2.putText(vis, txt, (x1, max(12, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, c, 1)
         cv2.putText(vis, self.engine.describe(), (6, vis.shape[0] - 8),

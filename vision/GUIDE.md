@@ -95,9 +95,12 @@ color_calib.py  现场 HSV 采样 -> 颜色区间        config.py  配置加载
 | `detect.min_area_px / max_area_px / edge_margin_px` | 过滤误检、贴边截断目标 |
 | `detect.parallax_factor` | 抓取高度 = 物体高度 × 该值（0.6 ≈ 上表面附近） |
 | `scan.frames / min_hit_ratio / match_px` | 融合帧数 / 出现比例下限 / 匹配距离 |
+| `color.source` | `hsv`（默认：HSV 投票为权威，`classes.json` 的 `model_color` 只做冲突检测）/ `model`（应急：颜色直接用 `model_color`，**换颜色后就失效**，只用于板上 HSV 不可用时） |
+| `color.conflict_ttl_s / conflict_conf` | 冲突记忆 TTL（默认 60s）/ 比赛模式首次冲突把置信度压到的值（默认 0.43，须 < `COMMIT_CONF` 0.45，压下去才会触发一次抖料重扫） |
+| `color.tray_white_balance / wb_gain_min / wb_gain_max / wb_min_pixels` | 托盘白基准归一化（默认 **false**）；增益限幅 0.7~1.4；可用像素不足 200 时沿用上次增益。**只作用于颜色投票前的裁剪图，不改送模型的图**。`[现场待验证]` |
 | `record.enabled / dir / keep` | 每次 scan 存原图+标注图+json（`records/scans`），也是量化校准图来源 |
 
-环境变量临时覆盖：`IS_CAM_TYPE IS_CAM_DEVICE IS_CAM_SERIAL IS_CAM_REPLAY IS_CAM_W/H/FPS IS_CAM_EXPOSURE IS_CAM_GAIN IS_CAM_WB IS_YOLO_MODEL IS_YOLO_CONF IS_YOLO_IOU IS_PARALLAX_FACTOR IS_SCAN_FRAMES IS_VISION_RECORD IS_VISION_CONFIG IS_CAM_HEIGHT_MM`。`IS_YOLO_CONF` 超出 0.05~0.95、`IS_YOLO_IOU` 超出 0.10~0.95 或不是数字时退回默认值，并写进自检问题（不会再静默检测全空）。颜色投票全落在 `hue_bins` 空隙时判 `unknown`，不再误判成 black。
+环境变量临时覆盖：`IS_CAM_TYPE IS_CAM_DEVICE IS_CAM_SERIAL IS_CAM_REPLAY IS_CAM_W/H/FPS IS_CAM_EXPOSURE IS_CAM_GAIN IS_CAM_WB IS_YOLO_MODEL IS_YOLO_CONF IS_YOLO_IOU IS_PARALLAX_FACTOR IS_SCAN_FRAMES IS_VISION_RECORD IS_VISION_CONFIG IS_CAM_HEIGHT_MM IS_COLOR_SOURCE IS_TRAY_WB IS_COMPETITION_LOCK`。`IS_YOLO_CONF` 超出 0.05~0.95、`IS_YOLO_IOU` 超出 0.10~0.95 或不是数字时退回默认值，并写进自检问题（不会再静默检测全空）。颜色投票全落在 `hue_bins` 空隙时判 `unknown`，不再误判成 black。
 
 ## 6. calib_config.json（`tray` 段）
 | 键 | 说明 |
@@ -123,10 +126,23 @@ DFOV 规格也能反算（`f = 对角像素/2 / tan(DFOV/2)`，100° 时 f@1920=
 ## 7. classes.json
 - `classes` 顺序 = 模型类别顺序，`./convert.sh` 自动按模型重排；新类别要补 `shape_cn`（中文名）和 `height_mm`。
 - `color: null` = 颜色由 HSV 判（推荐：决赛换颜色不用重训）。
+- `model_color`: 类名里的颜色（如 `红色镂空立方体` → `red`），**只用于与 HSV 结果做冲突检测和界面提示，不参与 `category`**；无法判定填 `null`。
+- `shape_cn`: 形状英文键，是 `category` 的**第一段**（取值 `hollow_cube / tri_prism / hemisphere / cone / penta_prism / tetrahedron / cylinder`）。没有它才退回类名 —— 旧版本用类名当形状，`category` 会随模型颜色变化（现场 `蓝色半球|red|` 就是这条 bug）。
 - `decode_qr: true`：解码二维码，内容参与分类。
 - 分类键 `category = 形状|颜色|信息`，相同才进同一盒；`label` 是大屏显示名（可用 `name` 覆盖）。
 - `thin_wall: true`：薄壁/空心件，颜色只取壁上像素，抓取点取外轮廓几何中心。
 - `hsv`：颜色区间，浏览器「颜色」页生成。
+
+### 7.1 颜色来源与冲突仲裁（A1）
+颜色**以 HSV（锁曝光/增益/白平衡后重新标定）为权威**；模型类名里的颜色只当参考，所以决赛换颜色不用重训。
+
+- `category = 形状|颜色|信息`，**第一段永远是 `shape_cn`**，与类名颜色无关 —— 同一件货多次 scan 的 `category` 只随 HSV 变化。
+- `model_color` 与 HSV 投票不一致时：vision 打一条 `颜色冲突: 类=… shape=… 类名色=… HSV=… 模式=… 键=…` WARNING，并把 `model_color / hsv_color / color_conflict / color_source` 写进 `VisionTarget.diagnostics`（复盘 `scan_NNN.json` 里可见，调试台画面里该目标用洋红框 + 「冲突」字样）。
+- **比赛模式**（`/tmp/is_competition.lock` 存在）：同一冲突组合键 `形状|类名色|HSV色`（**不用位置作键**，抖料会把货挪走）第一次出现 → 把该目标置信度压到 `color.conflict_conf`（0.43 < `COMMIT_CONF` 0.45）触发一次「抖料重扫」；同一键再次出现 → 采信 HSV（颜色/category/label 同步重算）。每个键最多压一次，记忆 TTL `color.conflict_ttl_s`（默认 60s）。
+- **调试模式**：只告警 + 写 diagnostics，不压置信度。
+- 调试台「颜色」页/Scan 表格给三个按钮：**按 HSV**（把该组合记进冲突记忆，等同第二次自动采信）、**去颜色页重新采样**（跳颜色页并预选该颜色）、**本类强制颜色**（把 HSV 判定的颜色写进 `classes.json` 该类的 `color`；这是唯一写 `color` 的路径，写前备份 `.bak`，之后该类不再走 HSV 投票）。
+- 兜底：即使仲裁没生效，`MAX_UNCERTAIN_RETRY` 用尽后仍会抓取，不会结束本轮。
+
 
 ## 8. 换模型 / 换相机 / 复现
 - 换模型：`.pt` 放进 `vision/models/` → `./convert.sh`（`tools/GUIDE.md`）。

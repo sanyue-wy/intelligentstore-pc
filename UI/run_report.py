@@ -118,7 +118,11 @@ class RunReport:
                 with open(os.path.join(self.dir, f"scan_{idx:03d}.json"), "w", encoding="utf-8") as f:
                     from UI.planner import display_name
                     json.dump([{"label": display_name(t), "category": t.category, "conf": t.confidence,
-                                "u": t.u_pixel, "v": t.v_pixel, "bbox": t.bbox} for t in targets],
+                                "u": t.u_pixel, "v": t.v_pixel, "bbox": t.bbox,
+                                # A1: 旁路数据原样落盘 (颜色冲突/model_color/hsv_color...), 只加字段,
+                                # display_name 与 finish() 汇总逻辑不变。
+                                "diagnostics": dict(getattr(t, "diagnostics", None) or {})}
+                               for t in targets],
                               f, ensure_ascii=False, default=str)
             return name
         except Exception:

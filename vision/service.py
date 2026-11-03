@@ -35,7 +35,7 @@ from MessegeCenter.topics import (
 
 from .calibration import CoordinateCalibrator
 from .cameras import FrameGrabber, PhysicalCamera, apply_controls, create_camera
-from .config import VisionConfig, load_vision_config
+from .config import VisionConfig, load_vision_config, race_mode
 from .detector import WorkpieceDetector
 from .interfaces import (
     VisionBackend, VisionCapabilities, VisionServiceBase, register_vision_backend,
@@ -72,6 +72,8 @@ class VisionService(VisionServiceBase):
         self.warnings: List[str] = list(self.cfg.warnings)   # 启动时的配置告警, 不再追加运行期事件
         self._tray_event: tuple = (0.0, "")
 
+        # A1: 颜色冲突记忆 (键 = shape|model_color|hsv_color, 不用位置), 值 = 首次出现时间
+        self._color_conflict_mem: Dict[str, float] = {}
         self._rec_q: "queue.Queue" = queue.Queue(maxsize=8)
         self._rec_thread: Optional[threading.Thread] = None
         self._rec_n = 0
@@ -204,6 +206,7 @@ class VisionService(VisionServiceBase):
             logger.error("scan: 没有取到新图像 (%s)", msg or "相机无图")
             self.last_scan = {"ok": False, "error": msg or "no_frame", "time": time.time()}
             return [], None
+        n_conf = 0
         try:
             with self._detect_lock:
                 self._update_tray(frames)
@@ -214,6 +217,7 @@ class VisionService(VisionServiceBase):
                 else:
                     ref = frames[-1]
                     targets = det.detect(ref)
+                n_conf = self._arbitrate_colors(targets)     # A1: 颜色冲突仲裁 (先于绘制, 画面才能标出)
                 ann = det.annotate(ref, targets) if ref is not None else None
         except Exception:
             logger.exception("scan: 识别异常, 本次按无目标处理")
@@ -228,6 +232,7 @@ class VisionService(VisionServiceBase):
         self.last_scan = {"ok": True, "frames": len(frames), "targets": len(targets),
                           "grab_ms": round((t1 - t0) * 1e3, 1), "detect_ms": round((t2 - t1) * 1e3, 1),
                           "rejected": dict(getattr(self.detector, "rejected", {}) or {}),
+                          "color_conflicts": n_conf,
                           "time": time.time()}
         logger.info("scan: %d 帧 -> %d 件 (取图 %.0f ms, 识别 %.0f ms) %s",
                     len(frames), len(targets), (t1 - t0) * 1e3, (t2 - t1) * 1e3,
@@ -238,6 +243,60 @@ class VisionService(VisionServiceBase):
             pass
         self._enqueue_record(ref, ann, targets)
         return targets, ref
+
+    # ================================================================== A1 颜色仲裁
+    def _arbitrate_colors(self, targets: List[VisionTarget]) -> int:
+        """模型类名颜色 (model_color) 与 HSV 投票 (hsv_color) 冲突的告警/记忆/仲裁。
+
+        - 一律 WARNING + 写 t.diagnostics (model_color/hsv_color/color_conflict/color_source);
+        - 比赛模式 (config.race_mode()): 同一冲突组合键 shape|model_color|hsv_color
+          (**不用位置作键** —— 抖料会把货物挪走) 首次出现 -> 置信度压到 color.conflict_conf
+          (默认 0.43, < COMMIT_CONF 0.45) 触发一次抖料重扫, 该键记入记忆; 再次出现 ->
+          采信 HSV (颜色/category/label 同步重算); 每个键最多压一次;
+        - 记忆 TTL = color.conflict_ttl_s (默认 60s), 每次 scan 清理过期项;
+        - 调试模式只告警 + diagnostics, 不压置信度; 不影响其他目标与 scan() 返回结构。
+        返回本次冲突目标数 (写入 last_scan, 便于复盘统计)。
+        """
+        col = getattr(self.cfg, "color", {}) or {}
+        ttl = float(col.get("conflict_ttl_s", 60) or 60)
+        push_conf = float(col.get("conflict_conf", 0.43))
+        now = time.time()
+        mem = self._color_conflict_mem
+        for k in [x for x, ts in mem.items() if now - ts > ttl]:
+            mem.pop(k, None)
+        racing = race_mode()
+        conflicts = 0
+        for t in targets:
+            diag = t.diagnostics if isinstance(getattr(t, "diagnostics", None), dict) else None
+            if diag is None:
+                continue
+            mc, hc = diag.get("model_color"), diag.get("hsv_color")
+            if not mc or not hc or mc == hc:
+                continue
+            conflicts += 1
+            diag["color_conflict"] = True
+            key = f"{t.shape}|{mc}|{hc}"
+            logger.warning("颜色冲突: 类=%s shape=%s 类名色=%s HSV=%s 模式=%s 键=%s",
+                           t.class_name, t.shape, mc, hc, "比赛" if racing else "调试", key)
+            if not racing:
+                continue                        # 调试台: 只告警 + diagnostics
+            if key in mem:                      # 同一组合再次出现 -> 采信 HSV
+                if t.color != hc:
+                    t.color = hc
+                    t.category = f"{t.shape}|{hc}|{t.info}"
+                    t.label = self._label_for(t, hc)
+                diag["color_adopted"] = "hsv"
+            else:                               # 首次 -> 抖料一次 (每键最多压一次)
+                mem[key] = now
+                diag["color_conflict_first"] = True
+                if t.confidence >= push_conf:
+                    t.confidence = round(push_conf - 0.01, 3)
+        return conflicts
+
+    def _label_for(self, t: VisionTarget, color: str) -> str:
+        """按 color_names 的中文色名 + shape 重算显示名 (与 _build_target 的规则一致)。"""
+        cn = getattr(self.detector, "color_cn", {}) or {}
+        return str(cn.get(color, color)) + str(t.shape or "")
 
     # ================================================================== 自检
     def self_check(self, log: bool = True) -> Dict[str, Any]:

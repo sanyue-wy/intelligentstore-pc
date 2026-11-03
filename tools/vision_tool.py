@@ -69,9 +69,12 @@ def build_service(args, continuous=True):
 
 
 def t2d(t):
+    # A1: 多带 shape 与 diagnostics —— 调试台靠 color_conflict 把冲突目标标红并给三个按钮。
     return {"id": t.target_id, "label": t.label, "class": t.class_name, "color": t.color,
             "conf": round(t.confidence, 3), "u": t.u_pixel, "v": t.v_pixel,
             "x_mm": t.x_mm, "y_mm": t.y_mm, "hits": t.hits, "category": t.category,
+            "shape": getattr(t, "shape", ""),
+            "diag": dict(getattr(t, "diagnostics", None) or {}),
             "angle": t.angle_deg}
 
 
@@ -295,7 +298,9 @@ input[type=range]{width:220px}#msg{color:#fb3;min-height:18px}.thumb{width:160px
  增益 dB <input type="range" id="gain" min="0" max="24" step="0.5" oninput="$('gainv').innerText=this.value"> <span id="gainv"></span><br>
  白平衡 K <input type="range" id="wb" min="2500" max="7500" step="100" oninput="$('wbv').innerText=this.value"> <span id="wbv"></span><br>
  <button onclick="camset(false)">应用</button><button onclick="camset(true)">应用并保存</button><pre id="camst"></pre></div>
-<div class="pane" id="p_col"><p>选颜色, 点击画面里该颜色的货物 (每色 2~5 点, 不同位置), 全部点完后「生成」, 自动写 classes.json 的 hsv 区间并立即生效。</p>
+<div class="pane" id="p_col"><p>选颜色, 点击画面里该颜色的货物 (每色 2~5 点, 不同位置), 全部点完后「生成」, 自动写 classes.json 的 hsv 区间并立即生效。
+<div class="dim">颜色冲突处理 (Scan 表格里「颜色冲突」列, 画面里洋红框 + 「冲突」字样): <b>按 HSV</b> = 接受 HSV 判定 (本类本次会话生效);
+<b>去颜色页重新采样</b> = 跳本页并预选该类名色, 重新点几处「生成颜色区间」; <b>本类强制颜色</b> = 把 HSV 判定的颜色写进 classes.json 该类的 color (唯一写 color 的路径, 写前备份), 之后该类不再投票。详见 vision/GUIDE.md。</div></p>
  <select id="cname"><option>red</option><option>orange</option><option>yellow</option><option>green</option><option>light_blue</option><option>blue</option><option>purple</option><option>white</option><option>black</option><option>gray</option></select>
  <label><input type="checkbox" id="colmode"> 采样模式</label> <button onclick="colsolve()">生成颜色区间</button><button onclick="colclear()">清空</button><pre id="cols"></pre></div>
 <div class="pane" id="p_scr"><p>按最近一次 Scan 置信度最高的货物渲染, 与比赛大屏完全相同。</p><img id="scrimg" style="width:100%"></div>
@@ -351,9 +356,18 @@ $('v').onclick=async e=>{let r=$('v').getBoundingClientRect();let k=$('v').natur
  if($('goto').checked){if(!confirm(`机械臂开到 (${d.x_mm}, ${d.y_mm}) 上方? 确认周围无障碍`))return;$('msg').innerText+='  移动中...';
   let g=await post('/api/goto',{u,v,h:hh});$('msg').innerText=g.ok?`到位: 目标(${g.target}) 实际(${g.reached}) 偏差 ${g.err_mm} mm — 看夹爪是否正对货物中心`:'失败: '+g.error}}
 async function scan(){$('msg').innerText='扫描中...';let d=await post('/api/scan');
- $('msg').innerText=JSON.stringify(d.stat);let h='<table><tr><th>#</th><th>名称</th><th>类别</th><th>颜色</th><th>置信</th><th>像素</th><th>mm</th><th>帧</th></tr>';
- for(let t of d.targets)h+=`<tr><td>${t.id}</td><td>${t.label}</td><td>${t.class}</td><td>${t.color}</td><td>${t.conf}</td><td>${t.u},${t.v}</td><td>${t.x_mm},${t.y_mm}</td><td>${t.hits}</td></tr>`;
+ $('msg').innerText=JSON.stringify(d.stat);let h='<table><tr><th>#</th><th>名称</th><th>类别</th><th>颜色</th><th>置信</th><th>像素</th><th>mm</th><th>帧</th><th>颜色冲突</th></tr>';
+ for(let t of d.targets){let g=t.diag||{},cf=g.color_conflict;
+  h+=`<tr${cf?' style="background:#3a1030"':''}><td>${t.id}</td><td>${t.label}</td><td>${t.class}</td><td>${t.color}</td><td>${t.conf}</td><td>${t.u},${t.v}</td><td>${t.x_mm},${t.y_mm}</td><td>${t.hits}</td>`;
+  h+=cf?`<td><span class=bad>HSV=${g.hsv_color} / 类名=${g.model_color}</span><br><button onclick="accHSV('${t.class}','${t.shape}','${g.model_color}','${g.hsv_color}')">按 HSV</button><button onclick="goColor('${g.model_color}')">去颜色页重新采样</button><button onclick="forceColor('${t.class}','${g.hsv_color}')">本类强制颜色</button></td>`:'<td>-</td>';
+  h+='</tr>'}
  $('tb').innerHTML=h+'</table>'}
+async function accHSV(cls,shape,mc,hc){let d=await post('/api/color/accept_hsv',{class_name:cls,shape:shape,model_color:mc,hsv_color:hc});
+ $('msg').innerText=d.ok?`已接受 HSV=${hc} (本类/本次会话), key=${d.key}`:('失败: '+d.error)}
+function goColor(mc){tab('col');let s=$('cname');if(mc){for(let o of s.options)if(o.value==mc)s.value=mc}
+ $('msg').innerText='颜色页: 点画面里该颜色的货物重新采样 (2~5 点), 再点「生成颜色区间」'}
+async function forceColor(cls,c){if(!confirm(`把 ${cls} 的 color 强制写成 ${c}?\n会写 classes.json (先备份 .bak), 之后该类不再走 HSV 投票。`))return;
+ let d=await post('/api/color/force_class',{class_name:cls,color:c});$('msg').innerText=d.ok?`已写入 ${d.saved}: ${cls}.color=${d.color}`:('失败: '+d.error)}
 async function snap(){let d=await post('/api/snap');$('msg').innerText='已保存 '+d.path}
 async function setconf(v){$('cv').innerText=(v/100).toFixed(2);await J('/api/conf?value='+(v/100))}
 async function csolve(){let d=await post('/api/calib/solve');$('msg').innerText=JSON.stringify(d);refresh()}
@@ -519,6 +533,53 @@ def cmd_web(args):
         if hasattr(svc.detector, "hsv_cfg"):
             svc.detector.hsv_cfg = new
         return {"ok": True, "hsv": new, "saved": meta_path}
+
+    def color_force_class(body):
+        """A1 调试台「本类强制颜色」: 把 classes.json 里该类的 color 写死。
+
+        这是唯一允许写 classes.json `color` 字段的路径, 写前备份 .bak 且其余键原样保留。
+        该类 color 非 null 后 -> detector 不再对它走 HSV 投票 (人为强制优先)。
+        """
+        cls = str(body.get("class_name") or "")
+        col = str(body.get("color") or "")
+        if not cls or not col:
+            return {"ok": False, "error": "需要 class_name 与 color"}
+        meta_path = getattr(svc.detector, "meta_path", os.path.join(ROOT, "vision", "classes.json"))
+        data = _load_json(meta_path, None)
+        if not isinstance(data, dict):
+            return {"ok": False, "error": f"读不到 {meta_path}"}
+        hit = None
+        for c in (data.get("classes") or []):
+            if c.get("name") == cls:
+                hit = c
+                break
+        if hit is None:
+            return {"ok": False, "error": f"classes.json 里没有类 {cls}"}
+        names = list((data.get("color_names") or {}).keys())
+        if names and col not in names:
+            return {"ok": False, "error": f"颜色 {col} 不在 color_names: {names}"}
+        if os.path.exists(meta_path):
+            import shutil
+            shutil.copy(meta_path, meta_path + ".bak")
+        hit["color"] = col
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        cm = getattr(svc.detector, "class_meta", None)
+        if isinstance(cm, dict) and cls in cm:      # 立即生效, 不必重启
+            cm[cls]["color"] = col
+        return {"ok": True, "saved": meta_path, "class_name": cls, "color": col}
+
+    def color_accept_hsv(body):
+        """A1 调试台「按 HSV」: 把该冲突组合记进 service 的冲突记忆 (本类/本次会话生效)。
+
+        等价于"第二次遇见该组合自动采信 HSV", 省掉现场再抖一次料。
+        """
+        key = f"{body.get('shape', '')}|{body.get('model_color', '')}|{body.get('hsv_color', '')}"
+        mem = getattr(svc, "_color_conflict_mem", None)
+        if mem is None:
+            return {"ok": False, "error": "当前视觉服务不支持冲突记忆"}
+        mem[key] = time.time()
+        return {"ok": True, "key": key, "entries": len(mem)}
 
     def screen_png():
         from UI.display_ui import render_screen
@@ -988,6 +1049,10 @@ def cmd_web(args):
                 self._json({"ok": True})
             elif u == "/api/color/solve":
                 self._json(color_solve())
+            elif u == "/api/color/force_class":
+                self._json(color_force_class(self._body()))
+            elif u == "/api/color/accept_hsv":
+                self._json(color_accept_hsv(self._body()))
             elif u == "/api/tray":
                 self._json(tray_set(self._body()))
             elif u == "/api/tray/fixed":

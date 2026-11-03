@@ -543,5 +543,206 @@ class TestClassMeta(unittest.TestCase):
         self.assertEqual(det.class_meta["红色镂空立方体"]["height_mm"], 30)
 
 
+
+import unittest.mock
+
+
+class TestColorArbitration(unittest.TestCase):
+    """A1: category 第一段取 shape_cn (不再随模型类名颜色变) + model_color/HSV 冲突仲裁。
+
+    全部用例端到端走 `VisionService.scan()`: 真实 ReplayCamera + 真 YoloWorkpieceDetector,
+    只在实例上覆盖 `_infer` 注入 Detection (不碰真实模型/相机)。
+    """
+
+    SHAPE = "hemisphere"
+    NAMES = ["红色半球", "蓝色半球", "白色半球", "绿色半球"]
+    MODEL_COLOR = {"红色半球": "red", "蓝色半球": "blue", "白色半球": "white", "绿色半球": "green"}
+    HSV_CFG = {"black_v_max": 60, "white_s_max": 45, "white_v_min": 150,
+               "hue_bins": [["red", 0, 10], ["red", 170, 179],
+                            ["green", 40, 80], ["blue", 100, 130]]}
+    # 帧上四块纯色 (BGR): 改框位置但颜色不变, 用来证明冲突记忆的键不含位置
+    BOX_RED = (100, 100, 200, 200)
+    BOX_RED2 = (300, 300, 400, 400)
+    BOX_BLUE = (300, 100, 400, 200)
+    BOX_GREEN = (100, 300, 200, 400)
+
+    class _StubEngine:
+        def __init__(self, names):
+            self.class_names = list(names)
+            self.is_ready = True
+            self.last_error = ""
+
+        def describe(self):
+            return "stub-color-engine"
+
+    def _setup(self, source="hsv", color_extra=None):
+        import cv2
+        import json
+        import os
+        import tempfile
+        from vision.config import load_vision_config
+        from vision.interfaces import Detection
+        from vision.yolo_detector import YoloWorkpieceDetector
+
+        tmp = tempfile.mkdtemp(prefix="a1_color_")
+        frame = np.full((480, 640, 3), 40, np.uint8)
+        frame[100:200, 100:200] = (0, 0, 255)      # 红 (框 A)
+        frame[100:200, 300:400] = (255, 0, 0)      # 蓝
+        frame[300:400, 100:200] = (0, 255, 0)      # 绿
+        frame[300:400, 300:400] = (0, 0, 255)      # 红 (框 A2, 只换位置)
+        cv2.imwrite(os.path.join(tmp, "frame.png"), frame)
+
+        meta = {"color_names": dict([("red", "红色"), ("blue", "蓝色"),
+                                     ("white", "白色"), ("green", "绿色")]),
+                "hsv": dict(self.HSV_CFG),
+                "classes": [{"id": i, "name": n, "shape_cn": self.SHAPE, "color": None,
+                             "model_color": self.MODEL_COLOR[n], "height_mm": 30}
+                            for i, n in enumerate(self.NAMES)]}
+        meta_path = os.path.join(tmp, "classes.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        col = {"source": source}
+        col.update(color_extra or {})
+        cfg_path = os.path.join(tmp, "vision_config.json")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump({"color": col, "record": {"enabled": False},
+                       "camera": {"type": "replay", "path": tmp, "fps": 60,
+                                  "loop": True, "stale_s": 5.0}},
+                      f, ensure_ascii=False, indent=2)
+        cfg = load_vision_config(cfg_path)
+        det = YoloWorkpieceDetector(engine=self._StubEngine(self.NAMES),
+                                    meta_path=meta_path, config=cfg)
+        svc = VisionService(MessageBus(), detector_factory=lambda cal: det,
+                            continuous_detect=False, config=cfg)
+        svc.start()
+        self.addCleanup(svc.stop)
+        self._det, self._Detection, self._tmp = det, Detection, tmp
+        return svc
+
+    def _detecting(self, name, conf=0.9, box=None):
+        D = self._Detection
+        box = box or self.BOX_RED
+        self._det._infer = lambda frame: [D(0, name, conf, *box)]
+
+    def _scan(self, svc, n=2):
+        ts, _ref = svc.scan(n_frames=n, skip_frames=0)
+        self.assertTrue(ts, "scan() 应至少返回 1 个目标 (replay 相机/注入是否失效?)")
+        return ts
+
+    def test_category_is_independent_of_model_color_word(self):
+        """核心: 同一张图 + 同一 HSV, 把模型类从「红色半球」换成「蓝色半球」-> category 逐字符相同。"""
+        svc = self._setup()
+        self._detecting("红色半球")
+        a = self._scan(svc)[0]
+        self._detecting("蓝色半球")
+        b = self._scan(svc)[0]
+        self.assertEqual(a.category, "hemisphere|red|")
+        self.assertEqual(b.category, a.category, "category 不该受模型类名里的颜色影响")
+
+    def test_shape_takes_shape_cn_not_class_name(self):
+        svc = self._setup()
+        self._detecting("白色半球")
+        t = self._scan(svc)[0]
+        self.assertEqual(t.shape, "hemisphere")
+        self.assertEqual(t.category.split("|")[0], "hemisphere")
+        for w in ("红", "黄", "蓝", "白", "灰", "色"):
+            self.assertNotIn(w, t.shape)
+        self.assertEqual(t.class_name, "白色半球")
+
+    def test_conflict_warns_and_records_diagnostics_in_debug_mode(self):
+        svc = self._setup()
+        self._detecting("蓝色半球")               # 类名色 blue, HSV 投票 red
+        with self.assertLogs("vision.service", level="WARNING") as cm:
+            t = self._scan(svc)[0]
+        self.assertTrue(t.diagnostics.get("color_conflict"))
+        self.assertEqual(t.diagnostics.get("model_color"), "blue")
+        self.assertEqual(t.diagnostics.get("hsv_color"), "red")
+        self.assertEqual(t.diagnostics.get("color_source"), "hsv")
+        self.assertTrue(any("颜色冲突" in m for m in cm.output), cm.output)
+        self.assertGreaterEqual(t.confidence, 0.45, "调试模式只告警, 不压置信度")
+        self.assertEqual(t.color, "red")
+
+    def test_race_mode_pushes_once_then_adopts_hsv(self):
+        """比赛模式: 同一冲突组合首次压置信度 -> 抖料; 换位置后第二次采信 HSV (键不含位置)。"""
+        import os
+        import tempfile
+        from unittest import mock
+        lock = os.path.join(tempfile.mkdtemp(prefix="a1_lock_"), "is_competition.lock")
+        with open(lock, "w"):
+            pass
+        with mock.patch.dict(os.environ, {"IS_COMPETITION_LOCK": lock}):
+            svc = self._setup(source="model")     # model 来源, 颜色初始=类名色, 便于观察"改成 HSV"
+            self._detecting("蓝色半球", box=self.BOX_RED)
+            a = self._scan(svc)[0]
+            self.assertLess(a.confidence, 0.45, "首次冲突必须压到 COMMIT_CONF(0.45) 以下")
+            self.assertEqual(a.category, "hemisphere|blue|")
+            self.assertTrue(a.diagnostics.get("color_conflict_first"))
+            self._detecting("蓝色半球", box=self.BOX_RED2)   # 同一组合, 位置换了
+            b = self._scan(svc)[0]
+            self.assertGreaterEqual(b.confidence, 0.45, "同一组合第二次不再压置信度")
+            self.assertEqual(b.color, "red")
+            self.assertEqual(b.category, "hemisphere|red|")
+            self.assertEqual(b.label, "红色hemisphere")
+
+    def test_conflict_ttl_expiry_pushes_again(self):
+        import os
+        import tempfile
+        from unittest import mock
+        lock = os.path.join(tempfile.mkdtemp(prefix="a1_lock_"), "is_competition.lock")
+        with open(lock, "w"):
+            pass
+        with mock.patch.dict(os.environ, {"IS_COMPETITION_LOCK": lock}):
+            svc = self._setup(color_extra={"conflict_ttl_s": 0.001})  # TTL 1ms -> 两次 scan 之间必然过期
+            self._detecting("蓝色半球")
+            a = self._scan(svc)[0]
+            b = self._scan(svc)[0]
+            self.assertLess(a.confidence, 0.45)
+            self.assertLess(b.confidence, 0.45, "TTL 到期后记忆被清, 应再压一次")
+
+    def test_hsv_source_is_legacy_behaviour(self):
+        svc = self._setup(source="hsv")
+        self._detecting("红色半球")
+        t = self._scan(svc)[0]
+        self.assertEqual(t.color, "red")
+        self.assertEqual(t.category, "hemisphere|red|")
+        self.assertFalse(t.diagnostics.get("color_conflict"))
+
+    def test_model_source_uses_model_color_when_consistent(self):
+        svc = self._setup(source="model")
+        self._detecting("红色半球")
+        t = self._scan(svc)[0]
+        self.assertEqual(t.diagnostics.get("color_source"), "model")
+        self.assertFalse(t.diagnostics.get("color_conflict"))
+        self.assertEqual(t.color, "red")
+        self.assertEqual(t.category, "hemisphere|red|")
+
+    def test_colour_missing_from_model_colour_still_uses_hsv(self):
+        """model_color 里没有 green; 绿货被识别成「红色半球」类 -> 颜色仍取 HSV。"""
+        svc = self._setup()
+        self._detecting("红色半球", box=self.BOX_GREEN)
+        t = self._scan(svc)[0]
+        self.assertEqual(t.color, "green")
+        self.assertEqual(t.category, "hemisphere|green|")
+        self.assertTrue(t.diagnostics.get("color_conflict"))
+
+    def test_shipped_classes_json_model_color_and_shape(self):
+        import json
+        import os
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "classes.json")
+        with open(p, encoding="utf-8") as f:
+            meta = json.load(f)
+        shapes = {"hollow_cube", "tri_prism", "hemisphere", "cone",
+                  "penta_prism", "tetrahedron", "cylinder"}
+        cn = meta.get("color_names") or {}
+        self.assertTrue(meta.get("classes"))
+        for c in meta["classes"]:
+            self.assertIn(c.get("shape_cn"), shapes, c)
+            self.assertIn("model_color", c, "%s 缺 model_color" % c.get("name"))
+            if c["model_color"] is not None:
+                self.assertIn(c["model_color"], cn, c)
+            self.assertIn(c.get("color"), (None,) + tuple(cn), c)
+
+
 if __name__ == "__main__":
     unittest.main()

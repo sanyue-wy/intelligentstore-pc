@@ -85,6 +85,10 @@ class VisionTarget:
     angle_deg: float = 0.0          # 最小外接矩形角度, 可供夹爪旋转使用
     hits: int = 1                   # 多帧融合时出现的帧数
     timestamp: float = field(default_factory=lambda: datetime.now().timestamp())
+    # ---- A1 旁路数据 (可选, 有默认值; 不参与对外契约, 原有 16 个字段名/语义未动) ----
+    # 约定键: model_color / hsv_color / color_conflict / color_source / category_core /
+    #         qr_decoder / qr_ms / qr_budget_exhausted
+    diagnostics: dict = field(default_factory=dict)
 
 
 @dataclass

@@ -7,7 +7,8 @@
     "model.class_conf: 按类别单独设置置信度阈值, 例 {\"cube_qr\": 0.30}",
     "detect.roi: 托盘区域多边形 [[u,v],...] (像素), 区域外的检测一律丢弃; [] = 不限制。用 vision_tool roi 交互生成。",
     "detect.edge_margin_px: 贴着画面边缘被截断的目标定位不准, 丢弃距边缘小于该值的框。",
-    "record.enabled: 每次 scan 保存原图与标注图, 赛后复盘/补充训练数据。record.dir 相对路径按工程根目录 (宿主上持久保存, 也是一键转换的量化校准图来源)。"
+    "record.enabled: 每次 scan 保存原图与标注图, 赛后复盘/补充训练数据。record.dir 相对路径按工程根目录 (宿主上持久保存, 也是一键转换的量化校准图来源)。",
+    "color 段见下 (A1 颜色来源/冲突仲裁, A6 托盘白基准)。"
   ],
   "backend": "yolo",
   "camera": {
@@ -28,8 +29,8 @@
   "model": {
     "path": "",
     "backend": "",
-    "conf": 0.40,
-    "iou": 0.50,
+    "conf": 0.4,
+    "iou": 0.5,
     "max_det": 40,
     "class_conf": {}
   },
@@ -53,5 +54,19 @@
     "enabled": true,
     "dir": "records/scans",
     "keep": 300
+  },
+  "color": {
+    "source": "hsv",
+    "tray_white_balance": false,
+    "wb_gain_min": 0.7,
+    "wb_gain_max": 1.4,
+    "wb_min_pixels": 200,
+    "conflict_ttl_s": 60,
+    "conflict_conf": 0.43,
+    "_说明": [
+      "A1 color.source: hsv=HSV 投票为权威(默认); model=应急, 直接用 classes.json 的 model_color(换颜色后失效)。",
+      "A1 color.conflict_conf: 比赛模式同一冲突组合首次出现时把置信度压到该值(需 < COMMIT_CONF 0.45), 触发一次抖料重扫; conflict_ttl_s=冲突记忆 TTL(秒)。",
+      "A6 color.tray_white_balance/gain_min/gain_max/wb_min_pixels: 托盘白基准归一化(默认关, 现场待验证)。"
+    ]
   }
 }
