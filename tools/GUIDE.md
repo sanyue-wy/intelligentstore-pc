@@ -3,7 +3,7 @@
 | 文件 | 用途 | 在哪跑 |
 |---|---|---|
 | `../convert.sh` → `convert_model.py` | 一键 .pt → ONNX → BPU .bin，同步类别、对拍、上板验证 | **板上**（编译自动交给笔记本）或 x86 电脑 |
-| `convert_config.json` | 远程编译机（笔记本）配置，`--setup-remote` 生成 | — |
+| `convert_config.json` | 远程编译机（笔记本）配置（`--setup-remote` 生成）+ **部署门禁阈值**（见 §1.1） | — |
 | `vision_tool.py` | 网页调试台 / 自检 / 采集 / 测速 / 回归集 | 板上 |
 | `train.py` / `data.yaml` | 训练（data.yaml 的 names 由转换脚本自动同步） | 电脑 |
 | `calib_intrinsics.py` | 镜头畸变：一键单张校正（「畸变」页「一键校正」/ `--one 照片`）、打印纸 `--make-board`、完整多角度标定 | 板上/电脑 |
@@ -19,13 +19,33 @@ ssh root@<X5_IP>
 cd <工程目录> && ./convert.sh
 ```
 
-它会依次：导出 6 头 ONNX → 与 .pt 逐框对拍 → 同步 `vision/classes.json` / `data.yaml` → **ONNX 立即可用**（CPU 推理）→ 用 `records/scans/raw`（比赛/调试时自动存的原图）生成量化校准数据 → 发给笔记本编译 → 取回 `.bin` → **板上与 ONNX 对比，一致才切换到 BPU** → 旧模型移到 `models/old/`。最后在执行页点「一键重启」生效。
+它会依次：导出 6 头 ONNX → 与 .pt 逐框对拍 → 用 `records/scans/raw`（比赛/调试时自动存的原图，有 `dataset/hard_cases` 时优先）生成量化校准数据 → 发给笔记本编译 → 取回 `.bin` → 板上与 ONNX 逐图对比 → **余弦相似度、BPU/ONNX 一致率都达标才写进 `vision/models/`、同步 `vision/classes.json` / `data.yaml`、把旧模型移到 `models/old/`**。任何一项不达标就**一个文件都不动**（退出码 3，继续用上一版模型，见 §1.1）。最后在执行页点「一键重启」生效。
 
 - **为什么要笔记本**：地瓜编译器 `hb_mapper` 只有 x86_64 版本，ARM 的 X5 上无法编译。
 - 笔记本不在线：停在 ONNX（结果正确，只是慢），开机联网后再 `./convert.sh` 自动补编译。
-- 同一个 .pt 再跑会提示"已是最新"；`--force` 重新转换。
-- 校准图不足 20 张：`python3 tools/vision_tool.py capture --count 60`（换货物摆放/数量）后重跑。
+- 同一个 .pt 再跑会提示"已是最新"；`--force` 重新转换，**并绕过部署门禁**（余弦/一致率不达标也强制部署）。
+- 校准图不足 20 张（`calib_min_images`）：`python3 tools/vision_tool.py capture --count 60`（换货物摆放/数量）后重跑；最多取 200 张（`calib_max_images`），有 `dataset/hard_cases` 时优先抽、尽量每类覆盖。
 - 程序选模型的规则：以 `models/` 里最新的 .pt 为准，用它转出的 `.bin` > `.onnx`；还没转换时临时直接用 .pt 并在自检里提示。
+
+### 1.1 部署门禁（`convert_config.json`）
+
+`convert_config.json` 除远程编译机配置外，还存部署门禁阈值；文件里的 `_门禁说明` 有逐项注释，改之前先读它。
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `calib_max_images` | `200` | 量化校准最多用多少张图 |
+| `calib_min_images` | `20` | 少于这个数直接报错退出（退出码 3） |
+| `cosine_min` | `0.99` | 编译前后余弦相似度下限，低于它**默认不部署** |
+| `consistency_min` | `0.85` | 板上 `.bin` 与 ONNX 逐图一致率下限 |
+| `hard_cases_dir` | `dataset/hard_cases` | 有该目录就优先抽这些图做校准（每类尽量覆盖）；没有就只用普通校准图 |
+| `regression_dir` | `dataset/regression` | 有该目录就跑类别正确率，写进模型旁的 `vision/models/*.json` |
+
+**门禁阈值优先级**：内置默认 < `tools/convert_config.json` < 环境变量 `IS_CALIB_MAX` / `IS_CALIB_MIN` / `IS_COSINE_MIN` / `IS_CONSISTENCY_MIN`（命令行同名参数 `--calib-max` 等最优先）。
+
+**不达标时默认不部署**：`convert_model.py` 退出码 3 并打印 `仍在使用上一版模型: <path>`，`vision/models/` 下文件一个都不动（不覆盖、不归档）。确认要强行上线才加 `--force`。
+
+- 只想看判定结果、不编译也不动文件：`--dry-run`。板上没有 `hb_mapper` 时可用 `--assume-cosine 0.98` / `--assume-consistency 0.8` **模拟**指标（输出里会标"命令行模拟值，无实测数据"，不是真实测量）。
+- `dataset/hard_cases`、`dataset/regression` 两个目录不存在时行为与原来完全一致（不报错）；复盘页「归档」会自动往这两个目录写难例/回归图。
 
 ## 2. 笔记本编译机（一次性配置，Windows + WSL）
 
@@ -65,9 +85,13 @@ python3 tools/convert_model.py best.pt --onnx-only
 ### 常用参数
 | 参数 | 作用 |
 |---|---|
-| `--force` | 同一个 .pt 重新转换 |
-| `--calib DIR` / `--calib-max 50` | 校准图片目录 / 张数 |
-| `--cal-type max\|kl\|mix` | 余弦相似度 < 0.99 时换校准方法 |
+| `--force` | 同一个 .pt 重新转换，并绕过部署门禁（余弦/一致率不达标也强制部署） |
+| `--calib DIR` / `--calib-max N` | 校准图片目录 / 张数（默认取 `calib_max_images`，即 200） |
+| `--hard-cases DIR` / `--regression DIR` | 指定难例目录 / 回归集目录（默认同配置里的 `dataset/hard_cases`、`dataset/regression`） |
+| `--no-regression` | 跳过回归集类别正确率 |
+| `--dry-run` | 只读：打印校准选图、各类覆盖与部署判定，不编译、不动任何文件 |
+| `--assume-cosine 0.98` / `--assume-consistency 0.8` | **仅 `--dry-run`**：用模拟指标代替实测（输出标注"无实测数据"） |
+| `--cal-type max\|kl\|mix` | 余弦相似度 < `cosine_min` 时换校准方法 |
 | `--int16` | 全 int16 量化（更准更慢） |
 | `--imgsz H W` | 输入尺寸（默认按相机比例 640x480 → 480 640） |
 | `--compiler auto\|local\|docker\|remote\|none` | 编译方式 |
