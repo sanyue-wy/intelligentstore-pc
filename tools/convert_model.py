@@ -22,12 +22,20 @@
     2. 按地瓜官方 Model Zoo 方式导出 "6 头" ONNX (每个 stride: cls(1,H,W,nc) + bbox(1,H,W,64), NHWC)
     3. ONNX 解码 与 ultralytics 原生预测逐框对拍
     4. 同步 vision/classes.json (顺序跟模型走, 已有中文名/颜色/高度保留) 和 tools/data.yaml
-    5. ONNX 放进 vision/models (旧模型移到 models/old/), 板端立即可用
-    6. 用真实现场图片生成量化校准数据 (letterbox114 -> RGB -> CHW uint8)
+    5. 判定 (下面 6~9 步的度量) —— **判定通过之前不碰 vision/models 任何文件**
+    6. 用真实现场图片生成量化校准数据 (letterbox114 -> RGB -> CHW uint8);
+       有 dataset/hard_cases 时优先抽取并尽量每类覆盖, 上限/下限见 tools/convert_config.json
     7. 编译: 本机 hb_mapper / OE docker / 远程笔记本 (march=bayes-e, nv12, data_scale=1/255)
-    8. 解析余弦相似度, < 0.99 警告
-    9. .bin 放进 vision/models; 有 BPU 时与 ONNX 结果对比, 不一致则不启用
-   10. --deploy 时 scp 到板子 (电脑上用)
+    8. 解析余弦相似度, < cosine_min (默认 0.99) 则**默认不部署** (--force 可强制)
+    9. 有 BPU 时与 ONNX 结果对比, 一致率 < consistency_min (默认 0.85) 同样不部署
+   10. 判定通过后才动 vision/models: 旧模型移到 models/old/, 放入 ONNX/.bin 与元数据
+   11. --deploy 时 scp 到板子 (电脑上用)
+
+    判定不通过时: 一个文件都不写/不移动, 打印 "仍在使用上一版模型: <路径>" 后退出 (码 3)。
+    这样不会出现 "旧模型已移走、新模型未部署" 的空档。
+    阈值全部走 tools/convert_config.json, 并可用环境变量覆盖:
+      calib_max_images=IS_CALIB_MAX  calib_min_images=IS_CALIB_MIN
+      cosine_min=IS_COSINE_MIN       consistency_min=IS_CONSISTENCY_MIN
 
 imgsz 默认取 vision_config.json 的相机分辨率 (640x480 -> 480 640, 无灰边, 比 640x640 少 25% 计算)。
 """
@@ -57,6 +65,9 @@ MODELS = os.path.join(VISION, "models")
 CLASSES_JSON = os.path.join(VISION, "classes.json")
 DATA_YAML = os.path.join(ROOT, "tools", "data.yaml")
 CONVERT_CFG = os.path.join(ROOT, "tools", "convert_config.json")
+DATASET = os.path.join(ROOT, "dataset")
+HARD_CASES_DIR = os.path.join(DATASET, "hard_cases")
+REGRESSION_DIR = os.path.join(DATASET, "regression")
 SSH_DIR = os.path.join(ROOT, "tools", ".convert_ssh")
 SSH_KEY = os.path.join(SSH_DIR, "id_ed25519")
 DEFAULT_DOCKER = "openexplorer/ai_toolchain_ubuntu_20_x5_cpu:v1.2.8"
@@ -130,6 +141,277 @@ def sha16(path):
 def write_json(path, obj):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+# ============================================================================ 1.5 部署门禁 (A7)
+# 阈值来源: tools/convert_config.json  <  环境变量  <  命令行。改配置即可调参, 不许写死在代码里。
+GATE_ENV = {"calib_max_images": "IS_CALIB_MAX", "calib_min_images": "IS_CALIB_MIN",
+            "cosine_min": "IS_COSINE_MIN", "consistency_min": "IS_CONSISTENCY_MIN"}
+GATE_DEFAULTS = {"calib_max_images": 200, "calib_min_images": 20,
+                 "cosine_min": 0.99, "consistency_min": 0.85,
+                 "hard_cases_dir": "dataset/hard_cases", "regression_dir": "dataset/regression"}
+GATE_FLOAT = ("cosine_min", "consistency_min")
+#: 写进模型旁 json 时由本脚本维护的字段; 其它字段 (别人加的) 原样保留
+META_KEYS = {"names", "imgsz", "source_pt", "source_sha256", "created", "layout", "input",
+             "cosine", "bpu_check", "regression", "decision"}
+
+
+def load_gate_cfg(path=None):
+    """门禁阈值: 默认值 -> 配置文件 -> 环境变量 (环境变量优先)。纯读配置, 不联网。"""
+    cfg = dict(GATE_DEFAULTS)
+    try:
+        with open(path or CONVERT_CFG, encoding="utf-8") as f:
+            raw = json.load(f)
+        for k in GATE_DEFAULTS:
+            if raw.get(k) is not None:
+                cfg[k] = raw[k]
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        warn(f"{path or CONVERT_CFG} 解析失败, 用默认门禁阈值: {e}")
+    for k, env in GATE_ENV.items():
+        v = os.environ.get(env)
+        if v is None or v == "":
+            continue
+        try:
+            cfg[k] = float(v) if k in GATE_FLOAT else int(float(v))
+        except ValueError:
+            warn(f"环境变量 {env}={v!r} 不是数字, 忽略 (沿用 {cfg[k]})")
+    return cfg
+
+
+class DeployDecision:
+    """纯决策结果 (不碰文件系统)。deploy=False 时调用方必须一个文件都不写、不移动。"""
+
+    def __init__(self, deploy, deploy_bin=False, reasons=None, notes=None):
+        self.deploy = bool(deploy)
+        self.deploy_bin = bool(deploy_bin)
+        self.reasons = list(reasons or [])
+        self.notes = list(notes or [])
+
+    def __bool__(self):
+        return self.deploy
+
+    def __repr__(self):
+        return (f"DeployDecision(deploy={self.deploy}, deploy_bin={self.deploy_bin}, "
+                f"reasons={self.reasons}, notes={self.notes})")
+
+
+def decide(cfg, m):
+    """
+    纯函数 (不读文件/不联网/不看硬件): 由门禁阈值 + 度量决定是否部署。
+
+    cfg: load_gate_cfg() 的结果 (cosine_min / consistency_min)
+    m:   force         bool          --force (绕过余弦/一致率门禁, 仍不免除 .bin 加载失败)
+         onnx_ok       bool          ONNX 解码与源模型对拍是否通过
+         has_bin       bool          本次是否有 .bin 可部署 (无编译器 / --onnx-only 时 False)
+         bpu_load_ok   bool | None   .bin 是否能在板端加载并验证 (None = 没做这项检查)
+         bpu_error     str
+         cosine        float | None  所有输出里最低的余弦相似度 (None = 日志里没解析到)
+         consistency   float | None  BPU 与 ONNX 的一致率 hit/tot (None = 没做这项检查)
+    """
+    force = bool(m.get("force"))
+    reasons, notes = [], []
+    if not m.get("onnx_ok", True):
+        reasons.append("ONNX 解码与源模型对拍未通过")
+    if not m.get("has_bin"):
+        notes.append("本次没有 .bin (无编译器 / --onnx-only), 只部署 ONNX")
+        return DeployDecision(not reasons, deploy_bin=False, reasons=reasons, notes=notes)
+    if m.get("bpu_load_ok") is False:
+        reasons.append("BPU .bin 无法加载或验证: %s" % (m.get("bpu_error") or "未知原因"))
+    cosine = m.get("cosine")
+    if cosine is None:
+        notes.append("未能从编译日志解析余弦相似度, 本次不做余弦门禁")
+    elif cosine < cfg["cosine_min"]:
+        if force:
+            notes.append(f"余弦相似度 {cosine:.4f} < {cfg['cosine_min']}, --force 强制部署")
+        else:
+            reasons.append(f"余弦相似度 {cosine:.4f} < {cfg['cosine_min']}")
+    cons = m.get("consistency")
+    if cons is None:
+        notes.append("未做 BPU/ONNX 一致率检查")
+    elif cons < cfg["consistency_min"]:
+        if force:
+            notes.append(f"BPU/ONNX 一致率 {cons:.3f} < {cfg['consistency_min']}, --force 强制部署")
+        else:
+            reasons.append(f"BPU 与 ONNX 一致率 {cons:.3f} < {cfg['consistency_min']}")
+    ok_ = not reasons
+    return DeployDecision(ok_, deploy_bin=ok_, reasons=reasons, notes=notes)
+
+
+def scan_hard_cases(d):
+    """dataset/hard_cases: 子目录名当类别名 -> {类名: [图片]}; 顶层散图归入 ""。没有目录返回 {}。"""
+    if not d or not os.path.isdir(d):
+        return {}
+    out = {}
+    for sd in sorted(x for x in glob.glob(os.path.join(d, "*")) if os.path.isdir(x)):
+        fs = list_images(sd)
+        if fs:
+            out[os.path.basename(sd)] = fs
+    top = [f for f in list_images(d) if os.path.dirname(f) == os.path.normpath(d)]
+    if top:
+        out.setdefault("", []).extend(top)
+    return out
+
+
+def plan_calib(cfg, general, hard_by_class=None):
+    """
+    纯函数 (只处理路径, 不读图): 选校准图。
+    有 hard_cases 时优先, 按类别轮询 -> 尽量每类覆盖; 再用普通图补足; 最多 cfg["calib_max_images"]。
+    返回 (选中列表, {类别: 选中张数})。张数不足下限由调用方判断 (见 calib_shortage)。
+    """
+    max_n = max(1, int(cfg.get("calib_max_images", 200)))
+    picked, seen, per_class = [], set(), {}
+
+    def take(f, cls):
+        if f in seen or len(picked) >= max_n:
+            return False
+        seen.add(f)
+        picked.append(f)
+        per_class[cls or "?"] = per_class.get(cls or "?", 0) + 1
+        return True
+
+    buckets = [(c, list(hard_by_class[c])) for c in sorted(hard_by_class or {})]
+    i = 0
+    while len(picked) < max_n and any(i < len(b) for _, b in buckets):
+        for c, b in buckets:
+            if i < len(b):
+                take(b[i], c)
+        i += 1
+    for f in general:
+        take(f, "")
+    return picked, per_class
+
+
+def calib_shortage(cfg, n):
+    """校准图片是否少于下限 (calib_min_images, 默认 20)。纯函数。"""
+    return int(n) < int(cfg.get("calib_min_images", 20))
+
+
+def labeled_images(d):
+    """dataset/regression/<类别名>/ 下的图片 -> [(路径, 类别名)]。没有目录返回 []。"""
+    if not d or not os.path.isdir(d):
+        return []
+    pairs = []
+    for sd in sorted(x for x in glob.glob(os.path.join(d, "*")) if os.path.isdir(x)):
+        cls = os.path.basename(sd)
+        for f in list_images(sd):
+            pairs.append((f, cls))
+    return pairs
+
+
+def class_accuracy(preds, truth):
+    """
+    纯函数: preds=[(路径, 预测类别名 or None)], truth={路径: 真值类别名}。
+    返回 {"total","correct","no_det","acc","per_class"}; 没有样本时 acc=None。
+    """
+    per, correct, no_det = {}, 0, 0
+    for f, pred in preds:
+        gt = truth.get(f)
+        if gt is None:
+            continue
+        st = per.setdefault(gt, {"n": 0, "hit": 0})
+        st["n"] += 1
+        if pred is None:
+            no_det += 1
+        elif pred == gt:
+            st["hit"] += 1
+            correct += 1
+    total = sum(v["n"] for v in per.values())
+    return {"total": total, "correct": correct, "no_det": no_det,
+            "acc": round(correct / total, 4) if total else None, "per_class": per}
+
+
+def load_manifest_safe(model_path):
+    """读模型旁 json; 读不到就返回 {} (不抛异常, 便于纯逻辑复用)。"""
+    if not model_path:
+        return {}
+    try:
+        from vision.yolo_engine import load_model_manifest
+        return load_model_manifest(model_path)
+    except Exception:
+        try:
+            with open(os.path.splitext(model_path)[0] + ".json", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+
+def current_model_path():
+    """当前实际在用的模型 (供 "仍在使用上一版模型: <path>" 打印)。只读。"""
+    try:
+        from vision.yolo_engine import resolve_model_path
+        return resolve_model_path()
+    except Exception:
+        return None
+
+
+def print_decision(d, dry_run=False):
+    """把决策 (通过/不通过) 打印出来。不写文件。"""
+    if d.deploy:
+        print("  判定: 可以部署" + (" (.bin + ONNX)" if d.deploy_bin else " (只部署 ONNX)"))
+    else:
+        warn("门禁不通过, 本次不部署 (vision/models 下文件未改动)")
+    for r in d.reasons:
+        print(f"  · 不通过: {r}")
+    for n in d.notes:
+        print(f"  · {n}")
+    if not d.deploy:
+        print(f"  仍在使用上一版模型: {current_model_path() or '(vision/models 下没有可加载模型)'}")
+        print("  候选模型留在 tools/build/ 下, 修好上面问题后重跑 ./convert.sh (或 --force 强制部署)")
+
+
+def apply_decision(d, paths, meta, dry_run=False):
+    """
+    只有决策通过 (且非 dry-run) 才动 models/: 归档旧模型 -> 放 ONNX -> 放 .bin -> 写元数据。
+    否则一个文件都不动, 返回 {"applied": False, "moved": [], "written": []}。
+    paths: {"models_dir","onnx_src","onnx_dst","bin_src","bin_dst","keep_sha"}
+    """
+    res = {"applied": False, "moved": [], "written": []}
+    if dry_run or not d.deploy:
+        return res
+    models_dir = paths.get("models_dir") or MODELS
+    os.makedirs(models_dir, exist_ok=True)
+    res["moved"] = retire_old_models(paths["keep_sha"], models_dir)
+    meta = dict(meta)
+    meta["decision"] = {"deploy": True, "deploy_bin": bool(d.deploy_bin), "notes": list(d.notes)}
+    for src, dst in ((paths.get("onnx_src"), paths.get("onnx_dst")),
+                     (paths.get("bin_src"), paths.get("bin_dst"))):
+        if not src or not dst or not os.path.exists(src):
+            continue
+        shutil.copy(src, dst)
+        res["written"].append(dst)
+        old = {k: v for k, v in load_manifest_safe(dst).items() if k not in META_KEYS}
+        old.update(meta)
+        write_json(os.path.splitext(dst)[0] + ".json", old)
+        res["written"].append(os.path.splitext(dst)[0] + ".json")
+    res["applied"] = True
+    return res
+
+
+def _abs_dir(p):
+    """配置/命令行给的目录: 相对路径按工程根解析。"""
+    p = p or ""
+    return p if os.path.isabs(p) else os.path.join(ROOT, p)
+
+
+def _fmt_per_class(per_class):
+    if not per_class:
+        return "(无)"
+    return ", ".join(f"{'未分类' if k == '?' else k}={v}" for k, v in sorted(per_class.items()))
+
+
+def apply_classes(names, no_sync=False):
+    """同步 vision/classes.json / tools/data.yaml (原文件先备份成 .bak)。"""
+    if no_sync:
+        print("  classes.json 同步: 跳过 (--no-sync-classes)")
+        return
+    added, unused = sync_classes(names)
+    print("  classes.json 同步完成 (原文件备份为 classes.json.bak)")
+    if added:
+        warn(f"新类别 {added} 已用默认元数据补齐: 请在 classes.json 填 shape_cn(中文名)/color/height_mm")
+    if unused:
+        print(f"  模型中已不存在的类别移到 _unused_classes: {unused}")
 
 
 # ============================================================================ 2. 导出
@@ -234,6 +516,35 @@ def verify_bin(bin_path, onnx_path, names, images, conf=0.35):
     return (tot, hit, float(np.mean(ms)) if ms else 0.0), ""
 
 
+def run_regression(onnx_path, names, reg_dir=None):
+    """有 dataset/regression 时, 用候选 ONNX 跑一遍类别正确率 (只读, 不写任何文件)。"""
+    pairs = labeled_images(reg_dir or REGRESSION_DIR)
+    if not pairs:
+        return None
+    try:
+        from vision.yolo_engine import YoloEngine
+        eng = YoloEngine(model_path=onnx_path, class_names=names, conf_thresh=0.35,
+                         iou_thresh=0.7, agnostic_nms=False, max_det=100, backend="onnx")
+        if not eng.is_ready:
+            warn(f"回归测试跳过: ONNX 加载失败 {eng.last_error}")
+            return None
+        preds = []
+        for f, _ in pairs:
+            img = cv2.imread(f)
+            if img is None:
+                continue
+            dets = eng.infer(img)
+            best = max(dets, key=lambda x: x.conf) if dets else None
+            preds.append((f, best.name if best is not None else None))
+        res = class_accuracy(preds, dict(pairs))
+        print(f"  类别正确率 {res['correct']}/{res['total']} = {res['acc']}"
+              f" (未检出 {res['no_det']} 张)")
+        return res
+    except Exception as e:
+        warn(f"回归测试跳过: {e}")
+        return None
+
+
 # ============================================================================ 4. 类别同步
 def sync_classes(names):
     data = {}
@@ -266,17 +577,17 @@ def sync_classes(names):
     return added, [c["id"] for c in unused]
 
 
-def retire_old_models(keep_sha):
+def retire_old_models(keep_sha, models_dir=None):
     """不是当前 .pt 转出来的模型 (以及更早的 .pt) 移到 models/old/, 避免误加载。"""
-    old_dir = os.path.join(MODELS, "old")
+    models_dir = models_dir or MODELS
+    old_dir = os.path.join(models_dir, "old")
     moved = []
-    from vision.yolo_engine import load_model_manifest
-    for f in glob.glob(os.path.join(MODELS, "*")):
+    for f in glob.glob(os.path.join(models_dir, "*")):
         if not os.path.isfile(f):
             continue
         ext = os.path.splitext(f)[1].lower()
         if ext in (".bin", ".onnx"):
-            if load_model_manifest(f).get("source_sha256", "") == keep_sha:
+            if load_manifest_safe(f).get("source_sha256", "") == keep_sha:
                 continue
         elif ext == ".pt":
             if sha16(f) == keep_sha:
@@ -318,17 +629,17 @@ compiler_parameters:
 """
 
 
-def prepare_calib(images, ws, h, w, max_n=50, dtype="uint8"):
+def prepare_calib(files, ws, h, w, dtype="uint8"):
     """
     校准数据 = 与板端一致的前处理 (letterbox114 -> RGB -> CHW), 归一化 (1/255) 在模型里做。
     uint8 与 float32 数值相同 (0~255), uint8 文件小 4 倍, 远程编译时传得快。
+    files 已经是 plan_calib() 选好的列表 (张数与类别覆盖在这里不再改)。
     """
     d = os.path.join(ws, "calib_data")
     shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d)
-    step_ = max(1, len(images) // max_n)
     n = 0
-    for f in images[::step_][:max_n]:
+    for f in files:
         img = cv2.imread(f)
         if img is None:
             continue
@@ -413,6 +724,12 @@ def save_remote_cfg(cfg):
         "wsl_distro: Windows 下指定 WSL 发行版名 (wsl -l -v 查看), 空 = 默认发行版",
         "remote_init: 编译前执行的命令, 例 conda 环境: source ~/miniconda3/bin/activate rdk",
         "remote_dir: 笔记本上的临时工作目录 (在 WSL 里)"]}
+    if os.path.exists(CONVERT_CFG):          # 保留别人写在配置里的 _ 注释键 (如 _门禁说明)
+        try:
+            with open(CONVERT_CFG, encoding="utf-8") as f:
+                out.update({k: v for k, v in json.load(f).items() if k.startswith("_")})
+        except Exception:
+            pass
     out.update(cfg)
     write_json(CONVERT_CFG, out)
 
@@ -540,11 +857,14 @@ def main():
                     help="模型输入尺寸, 默认按相机比例 (640x480 -> 480 640)")
     ap.add_argument("--calib", default="", help="量化校准图片目录 (现场真实画面 20~100 张). "
                     "默认依次尝试 tools/calib_images, records/scans/raw (比赛识别时自动保存的原图)")
-    ap.add_argument("--calib-max", type=int, default=50)
+    ap.add_argument("--calib-max", type=int, default=None,
+                    help="校准图片张数上限 (默认取 tools/convert_config.json 的 calib_max_images, "
+                         "环境变量 IS_CALIB_MAX 可覆盖)")
     ap.add_argument("--cal-float32", action="store_true", help="校准数据用 float32 (默认 uint8, 数值相同)")
     ap.add_argument("--name", default="", help="输出模型名前缀, 默认取 .pt 文件名")
     ap.add_argument("--onnx-only", action="store_true", help="只导出并验证 ONNX")
-    ap.add_argument("--force", action="store_true", help="即使已转换过也重新转换")
+    ap.add_argument("--force", action="store_true",
+                    help="即使已转换过也重新转换; 并绕过部署门禁 (余弦/一致率不达标也强制部署)")
     ap.add_argument("--compiler", choices=["auto", "local", "docker", "remote", "none"], default="auto",
                     help="auto: x86 上本机 hb_mapper > docker; ARM 板上 = remote (已配置时)")
     ap.add_argument("--docker-image", default=os.environ.get("OE_DOCKER_IMAGE", DEFAULT_DOCKER))
@@ -561,6 +881,17 @@ def main():
     ap.add_argument("--deploy", default=os.environ.get("BOARD", ""),
                     help="(电脑上用) 部署到板子: 用户@IP:板上工程根目录")
     ap.add_argument("--no-sync-classes", action="store_true")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="只做只读门禁判定 (不导出/不编译, 不写 vision/models 下任何文件) 并退出")
+    ap.add_argument("--hard-cases", default="", metavar="目录",
+                    help="难例图片目录, 优先用作校准图 (默认取 tools/convert_config.json 的 hard_cases_dir)")
+    ap.add_argument("--regression", default="", metavar="目录",
+                    help="回归图片目录 (每类一个子目录), 跑类别正确率 (默认取 regression_dir)")
+    ap.add_argument("--no-regression", action="store_true", help="跳过回归正确率测试")
+    ap.add_argument("--assume-cosine", type=float, default=None, metavar="V",
+                    help="[仅 --dry-run] 用模拟的余弦相似度 V 代替待编译的值 (不产生实测数据)")
+    ap.add_argument("--assume-consistency", type=float, default=None, metavar="V",
+                    help="[仅 --dry-run] 用模拟的 BPU/ONNX 一致率 V 代替待编译的值 (不产生实测数据)")
     a = ap.parse_args()
 
     if a.setup_remote is not None:
@@ -600,6 +931,53 @@ def main():
     have_bin = os.path.exists(bin_dst) and load_model_manifest(bin_dst).get("source_sha256") == sha
     print(f"源模型 {os.path.relpath(pt, ROOT)}  指纹 {sha}  输入 {h}x{w}"
           f"  ({'ARM 板上' if ON_BOARD else platform.machine()})")
+
+    # ------------------------------------------------------------ A7 部署门禁: 纯只读判定 (--dry-run)
+    gate = load_gate_cfg()
+    if a.calib_max is not None:
+        gate["calib_max_images"] = a.calib_max
+    if a.hard_cases:
+        gate["hard_cases_dir"] = a.hard_cases
+    if a.regression:
+        gate["regression_dir"] = a.regression
+
+    if a.dry_run:
+        hard = scan_hard_cases(_abs_dir(gate["hard_cases_dir"]))
+        images, src = (list_images(a.calib), a.calib) if a.calib else ([], "")
+        if not images:
+            for d in default_image_dirs():
+                images = list_images(d)
+                if images:
+                    src = d
+                    break
+        picked, per_class = plan_calib(gate, images, hard)
+        print("== 部署门禁判定 (--dry-run, 只读: 不写/不移动 vision/models 下任何文件) ==")
+        print(f"  校准图来源 {src or '(未找到)'}: 共 {len(images)} 张; "
+              f"hard_cases {sum(len(v) for v in hard.values())} 张 / {len(hard)} 类")
+        print(f"  选中 {len(picked)} 张 (上限 {gate['calib_max_images']}, 下限 {gate['calib_min_images']}); "
+              f"每类覆盖: {_fmt_per_class(per_class)}")
+        if calib_shortage(gate, len(picked)):
+            warn(f"校准图不足下限 {gate['calib_min_images']} 张 (现在 {len(picked)} 张)")
+        sims = parse_cosine(ws)
+        if a.assume_cosine is not None:
+            cosine, has_bin = a.assume_cosine, True
+            print(f"  [dry-run] 余弦相似度 {cosine:.4f} (命令行模拟值, 无实测数据)")
+        else:
+            cosine = min(v for _, v in sims) if sims else None
+            has_bin = bool(sims)
+            if sims:
+                print(f"  [dry-run] 余弦相似度 {cosine:.4f} (读自已有编译日志 {os.path.relpath(ws, ROOT)})")
+        cons = a.assume_consistency
+        if cons is not None:
+            has_bin = True
+            print(f"  [dry-run] BPU/ONNX 一致率 {cons:.3f} (命令行模拟值, 无实测数据)")
+        print(f"  阈值 cosine_min={gate['cosine_min']}  consistency_min={gate['consistency_min']}  "
+              f"force={bool(a.force)}")
+        d = decide(gate, {"force": a.force, "has_bin": has_bin, "onnx_ok": True,
+                          "cosine": cosine, "consistency": cons})
+        print_decision(d, dry_run=True)
+        return
+
     if have_bin and not a.force and not a.deploy:
         ok(f"已是最新: {os.path.basename(bin_dst)} 就是由这个 .pt 转换的 (重新转换加 --force)")
         return
@@ -640,6 +1018,16 @@ def main():
             "created": datetime.datetime.now().isoformat(timespec="seconds"),
             "layout": "6head cls,bbox NHWC", "input": "nv12 (bin) / rgb float (onnx)"}
 
+    hard = scan_hard_cases(_abs_dir(gate["hard_cases_dir"]))
+    if hard:
+        print(f"  hard_cases: {len(hard)} 类共 {sum(len(v) for v in hard.values())} 张 (优先用作校准图)")
+    calib_imgs, calib_per_class = plan_calib(gate, images, hard)
+    if calib_imgs:
+        print(f"  校准图: 选中 {len(calib_imgs)} 张 (上限 {gate['calib_max_images']}, "
+              f"下限 {gate['calib_min_images']}); 每类覆盖: {_fmt_per_class(calib_per_class)}")
+    # 类别同步也推迟到判定通过后 (避免"类别已同步但模型未部署")
+    do_sync = not reuse and not a.no_sync_classes
+
     if reuse:
         print("  ONNX 已由这个 .pt 导出过, 跳过 1~5 步, 直接编译")
         meta.update({k: v for k, v in load_model_manifest(onnx_dst).items() if k in ("names", "created")})
@@ -674,26 +1062,27 @@ def main():
             warn("没有图片, 跳过对拍 (板上跑一次 vision_tool check 或比赛流程就会自动存图)")
 
         step(4, "同步 vision/classes.json / tools/data.yaml")
-        if a.no_sync_classes:
-            print("  跳过")
-        else:
-            added, unused = sync_classes(names)
-            print("  完成 (原文件备份为 classes.json.bak)")
-            if added:
-                warn(f"新类别 {added} 已用默认元数据补齐: 请在 classes.json 填 shape_cn(中文名)/color/height_mm")
-            if unused:
-                print(f"  模型中已不存在的类别移到 _unused_classes: {unused}")
+        print("  推迟到部署判定通过之后执行 (判定不通过时不动任何文件)")
 
-        step(5, "ONNX 放进 vision/models (立即可用)")
-        os.makedirs(MODELS, exist_ok=True)
-        moved = retire_old_models(sha)
-        if moved:
-            print(f"  旧模型移到 models/old/: {moved}")
-        shutil.copy(onnx_path, onnx_dst)
-        write_json(os.path.splitext(onnx_dst)[0] + ".json", meta)
-        print("  ->", os.path.relpath(onnx_dst, ROOT))
+        step(5, "准备候选模型 (判定通过后才写入 vision/models)")
+        print("  候选 ONNX 在", os.path.relpath(onnx_path, ROOT),
+              "; 判定通过前不动 vision/models 下任何文件")
 
     if mode == "none":
+        # 只出 ONNX: 同样先判定再落盘 (不部署时不动 vision/models)
+        d = decide(gate, {"force": a.force, "has_bin": False, "onnx_ok": True})
+        if a.onnx_only and not d.deploy:
+            print_decision(d, dry_run=False)
+            sys.exit(3)
+        if do_sync:
+            apply_classes(names, no_sync=False)
+        paths = {"models_dir": MODELS, "onnx_src": os.path.join(ws, "model.onnx"), "onnx_dst": onnx_dst,
+                 "bin_src": None, "bin_dst": None, "keep_sha": sha}
+        r = apply_decision(d, paths, meta)
+        if r["moved"]:
+            print(f"  旧模型移到 models/old/: {r['moved']}")
+        for p in r["written"]:
+            print("  ->", os.path.relpath(p, ROOT))
         if a.onnx_only:
             ok(f"已输出 {os.path.relpath(onnx_dst, ROOT)}")
         else:
@@ -707,13 +1096,14 @@ def main():
         return
 
     step(6, "生成量化校准数据")
-    if len(images) < 20:
-        die("校准需要至少 20 张 (建议 50) 比赛相机拍的真实托盘图片: "
+    if calib_shortage(gate, len(calib_imgs)):
+        die(f"校准需要至少 {gate['calib_min_images']} 张 (建议 {gate['calib_max_images']}) "
+            "比赛相机拍的真实托盘图片: "
             "python3 tools/vision_tool.py capture --count 60  (换货物摆放/数量), 或用 --calib 指定目录。\n"
             "  ONNX 已可用, 补齐图片后再运行 ./convert.sh", code=3)
     dtype = "float32" if a.cal_float32 else "uint8"
-    n = prepare_calib(images, ws, h, w, max_n=a.calib_max, dtype=dtype)
-    print(f"  {n} 张 ({dtype}) -> {os.path.relpath(ws, ROOT)}/calib_data")
+    n = prepare_calib(calib_imgs, ws, h, w, dtype=dtype)
+    print(f"  {n} 张 ({dtype}, 上限 {gate['calib_max_images']}) -> {os.path.relpath(ws, ROOT)}/calib_data")
     with open(os.path.join(ws, "config.yaml"), "w") as f:
         f.write(YAML_TMPL.format(onnx="model.onnx", prefix=prefix, cal_type=a.cal_type, cal_dtype=dtype,
                                  int16=",set_all_nodes_int16" if a.int16 else "",
@@ -742,37 +1132,63 @@ def main():
 
     step(8, "检查量化精度")
     sims = parse_cosine(ws)
+    cosine = min(v for _, v in sims) if sims else None
     if sims:
         for k, v in sims:
-            print(f"  {k}: cosine={v:.4f}" + ("   <-- 偏低" if v < 0.99 else ""))
-        if min(v for _, v in sims) < 0.99:
-            warn("有输出余弦相似度 < 0.99: 换更有代表性的校准图, 或 --cal-type max/kl, 或 --int16")
+            print(f"  {k}: cosine={v:.4f}"
+                  + (f"   <-- 低于门禁 {gate['cosine_min']}" if v < gate["cosine_min"] else ""))
+        if cosine < gate["cosine_min"]:
+            warn(f"有输出余弦相似度 < {gate['cosine_min']}: 换更有代表性的校准图, "
+                 "或 --cal-type max/kl, 或 --int16")
     else:
         warn("未能从日志解析余弦相似度, 请手动查看 hb_mapper_makertbin.log")
     meta["cosine"] = dict(sims)
 
-    step(9, "启用 .bin")
+    onnx_src = os.path.join(ws, "model.onnx")
+    if not a.no_regression:
+        reg = run_regression(onnx_src, meta.get("names") or names, _abs_dir(gate["regression_dir"]))
+        if reg:
+            meta["regression"] = reg
+
+    step(9, "判定并启用 .bin")
     from vision.yolo_engine import is_bpu_available
-    tmp = bin_dst + ".new"
+    tmp = os.path.join(ws, "new.bin")          # 候选 .bin 先放工作区, 判定通过后才进 vision/models
     shutil.copy(bins[0], tmp)
+    cons, bpu_ok, bpu_err = None, None, ""
     if ON_BOARD and is_bpu_available():
-        names = meta.get("names") or names
-        res, err = verify_bin(tmp, onnx_dst, names, images)
+        res, err = verify_bin(tmp, onnx_src, meta.get("names") or names, images)
         if res is None:
-            os.remove(tmp)
-            die(f"{err}  (.bin 未启用, 继续用 ONNX)")
-        tot, hit, ms = res
-        print(f"  BPU 与 ONNX 一致 {hit}/{tot} 框, BPU 每帧 {ms:.1f} ms")
-        if tot and hit < 0.85 * tot:
-            os.remove(tmp)
-            die("BPU 结果与 ONNX 差异过大, .bin 未启用 (继续用 ONNX)。试 --cal-type max 或 --int16, "
-                "并把本输出发给维护者")
-        meta["bpu_check"] = {"match": f"{hit}/{tot}", "ms": round(ms, 1)}
+            bpu_ok, bpu_err = False, err
+            warn(f"{err} (.bin 候选未能上板加载)")
+        else:
+            tot, hit, ms = res
+            cons = (float(hit) / tot) if tot else None
+            bpu_ok = True
+            print(f"  BPU 与 ONNX 一致 {hit}/{tot} 框"
+                  + (f" (一致率 {cons:.3f})" if cons is not None else "") + f", BPU 每帧 {ms:.1f} ms")
+            meta["bpu_check"] = {"match": f"{hit}/{tot}", "ms": round(ms, 1), "consistency": cons}
     elif ON_BOARD:
         warn("本机 BPU 运行库不可用, 无法上板验证 .bin (容器需挂载宿主运行库, 见 deploy/bpu_doctor.sh)")
-    os.replace(tmp, bin_dst)
-    write_json(os.path.splitext(bin_dst)[0] + ".json", meta)
-    print("  ->", os.path.relpath(bin_dst, ROOT))
+
+    print(f"  门禁阈值 cosine_min={gate['cosine_min']}  consistency_min={gate['consistency_min']}  "
+          f"force={bool(a.force)}")
+    d = decide(gate, {"force": a.force, "has_bin": True, "onnx_ok": True,
+                      "bpu_load_ok": bpu_ok, "bpu_error": bpu_err,
+                      "cosine": cosine, "consistency": cons})
+    if not d.deploy:
+        print_decision(d, dry_run=False)
+        sys.exit(3)
+
+    if do_sync:
+        apply_classes(names, no_sync=False)
+    paths = {"models_dir": MODELS, "onnx_src": onnx_src, "onnx_dst": onnx_dst,
+             "bin_src": bins[0], "bin_dst": bin_dst, "keep_sha": sha}
+    r = apply_decision(d, paths, meta)
+    print_decision(d, dry_run=False)
+    if r["moved"]:
+        print(f"  旧模型移到 models/old/: {r['moved']}")
+    for p in r["written"]:
+        print("  ->", os.path.relpath(p, ROOT))
 
     if a.deploy:
         print("\n部署到板子")

@@ -11,5 +11,24 @@
   "wsl_distro": "Ubuntu",
   "remote_dir": "~/rdk_convert",
   "remote_init": "",
-  "ssh_port": 22
+  "ssh_port": 22,
+
+  "_门禁说明": [
+    "A7 部署门禁阈值。改这里即可调参, 不用改代码; 命令行/环境变量优先级更高。",
+    "优先级: 命令行参数 > 环境变量 (见括号) > 本文件 > 代码内置默认值 (与下面一致)。",
+    "calib_max_images (IS_CALIB_MAX): 量化校准图片张数上限, 默认 200 (原来写死 50)。",
+    "calib_min_images (IS_CALIB_MIN): 少于这个张数就拒绝部署并提示补图, 默认 20 (原来写死 20)。",
+    "cosine_min (IS_COSINE_MIN): 所有输出余弦相似度的下限, 低于它就默认不部署 (原为只警告), 默认 0.99。",
+    "consistency_min (IS_CONSISTENCY_MIN): BPU 与 ONNX 一致率 hit/tot 的下限, 低于它默认不部署 (原为写死 0.85), 默认 0.85。",
+    "hard_cases_dir: 难例图片目录 (每类一个子目录, 子目录名=类别名), 有就优先用作校准图并尽量每类覆盖, 默认 dataset/hard_cases。",
+    "regression_dir: 回归图片目录 (每类一个子目录), 有就测类别正确率并写进模型旁的 .json, 默认 dataset/regression。",
+    "两个目录都不存在时行为与原来完全一致 (不影响转换, 只是不做这两项)。",
+    "--force 会绕过 cosine_min / consistency_min 门禁 (强制部署), 但 .bin 装不上时仍旧不部署。"
+  ],
+  "calib_max_images": 200,
+  "calib_min_images": 20,
+  "cosine_min": 0.99,
+  "consistency_min": 0.85,
+  "hard_cases_dir": "dataset/hard_cases",
+  "regression_dir": "dataset/regression"
 }
