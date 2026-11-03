@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -82,6 +83,14 @@ class YoloWorkpieceDetector(WorkpieceDetector):
                 self.class_meta[name] = c
         self.refine = bool(det_cfg.get("refine", True)) if refine is None else refine
         self.decode_qr_enabled = bool(det_cfg.get("decode_qr", True))
+        # A4 信息维度: require_info=true 时 info 解不出必须是 "unknown" 并压置信度触发抖料
+        self.require_info = bool(getattr(self.cfg, "require_info", False))
+        self.require_info_conf = float(det_cfg.get("require_info_conf", 0.43) or 0.43)
+        # A4 QR 时间预算: detect.qr_budget_ms 按「整次 scan」计 (detect()/detect_multi() 入口重置)
+        self.qr_budget_ms = float(det_cfg.get("qr_budget_ms", 500) or 0)
+        self._qr_budget_left = self.qr_budget_ms
+        self._qr_used_ms = 0.0
+        self._qr_exhausted = self.qr_budget_ms <= 0
         # A1 颜色来源: hsv(默认, HSV 投票为权威) | model(应急: 直接用类名颜色)
         self.color_source = str((getattr(self.cfg, "color", {}) or {}).get("source", "hsv")).lower()
         self.parallax_factor = float(det_cfg.get("parallax_factor", 0.6))
@@ -178,6 +187,7 @@ class YoloWorkpieceDetector(WorkpieceDetector):
             return []
         if not self._engine_ready():
             return self._hsv_fallback(bgr_frame)
+        self._reset_qr_budget()
         return [self._build_target(bgr_frame, d, i + 1, refine=self.refine)
                 for i, d in enumerate(self._infer(bgr_frame))]
 
@@ -197,6 +207,7 @@ class YoloWorkpieceDetector(WorkpieceDetector):
             return [], None
         if not self._engine_ready():
             return self._hsv_fallback(frames[-1]), frames[-1]
+        self._reset_qr_budget()
         n = len(frames)
         min_hits = min_hits or max(1, int(np.ceil(n * min_hit_ratio)))
 
@@ -243,9 +254,38 @@ class YoloWorkpieceDetector(WorkpieceDetector):
         for t in ts:
             t.label = self.color_cn.get(t.color, t.color) + "货物"
             t.category = f"{t.shape}|{t.color}|"
+            # A4: category_core (形状|颜色|) 每个目标都要有, 与 YOLO 路径一致
+            t.diagnostics.update({"category_core": f"{t.shape}|{t.color}|"})
         return ts
 
     # ================================================================== 单目标
+    def _parse_info(self, meta: dict) -> Tuple[str, bool, Optional[str]]:
+        """解析 classes.json 的信息声明 (A4)。返回 (声明值, 是否尝试扫码, template_set)。
+
+        info 可以是字符串 (旧用法, 直接当声明值), 也可以是
+        ``{"qr": ..., "text": ..., "template_set": ..., "decode_qr": bool}``。
+        ``decode_qr``: info.decode_qr 优先, 否则回退**旧的顶层** decode_qr 字段; 两者都没有
+        就不尝试解码 —— 与 A1 及以前的行为完全一致 (require_info 默认 false 时逐步不变)。
+        """
+        raw = meta.get("info")
+        text, template_set, flag = "", None, None
+        if isinstance(raw, dict):
+            text = str(raw.get("text") or raw.get("qr") or "").strip()
+            template_set = raw.get("template_set") or None
+            if "decode_qr" in raw:
+                flag = bool(raw.get("decode_qr"))
+        elif raw:
+            text = str(raw).strip()
+        if flag is None and "decode_qr" in meta:
+            flag = bool(meta.get("decode_qr"))
+        return text, bool(flag), template_set
+
+    def _reset_qr_budget(self) -> None:
+        """每次 scan 重置 QR 时间预算 (detect.qr_budget_ms 按整次 scan 计, 不是每件)。"""
+        self._qr_budget_left = self.qr_budget_ms
+        self._qr_used_ms = 0.0
+        self._qr_exhausted = self.qr_budget_ms <= 0
+
     def _build_target(self, frame: np.ndarray, d: Detection, idx: int, refine: bool) -> VisionTarget:
         meta = self.class_meta.get(d.name, {})
         h_img, w_img = frame.shape[:2]
@@ -266,11 +306,18 @@ class YoloWorkpieceDetector(WorkpieceDetector):
             color = model_color
         else:
             color = hsv_color
-        info = meta.get("info", "") or ""
-        if refine and self.decode_qr_enabled and meta.get("decode_qr"):
+        # A4 信息维度: 声明值来自 classes.json 的 info; 「是否解码」只由声明决定 (没声明就不解),
+        # 保证 require_info 默认 false 时与 A1 行为逐步一致。
+        info_decl, want_qr, template_set = self._parse_info(meta)
+        info = info_decl
+        qr = {"text": "", "ms": 0.0, "decoder": "none", "attempted": False,
+              "exhausted": bool(self._qr_exhausted)}
+        if refine and self.decode_qr_enabled and want_qr:
             qr = self._decode_qr(frame, x1, y1, x2, y2)
-            if qr:
-                info = f"{info}:{qr}" if info else qr
+            if qr["text"]:
+                info = f"{info}:{qr['text']}" if info else qr["text"]
+        if self.require_info and not info:
+            info = "unknown"      # A4: 解不出必须是 unknown (不许空串, 更不许猜)
 
         # A1: classes.json 只有 shape_cn; 旧代码 `meta.get("shape", d.name)` 会把「带颜色的
         # 中文类名」当形状 (现场: 新类别 蓝色半球|red|), category 第一段随模型颜色变化。
@@ -286,15 +333,33 @@ class YoloWorkpieceDetector(WorkpieceDetector):
         label = meta.get("name") or (self.color_cn.get(color, color) + meta.get("shape_cn", shape))
         if info and not meta.get("name"):
             label += f"({info})"
-        return VisionTarget(
-            target_id=idx, color=color, shape=shape, confidence=round(float(d.conf), 3),
+        # A4: require_info 但信息解不出 -> 压到 COMMIT_CONF(0.45) 以下, 交给 uncertain 抖料重扫
+        conf = float(d.conf)
+        info_missing = bool(self.require_info and info == "unknown")
+        if info_missing:
+            conf = min(conf, self.require_info_conf)
+        tgt = VisionTarget(
+            target_id=idx, color=color, shape=shape, confidence=round(float(conf), 3),
             u_pixel=round(float(u), 1), v_pixel=round(float(v), 1), x_mm=x_mm, y_mm=y_mm,
             class_name=d.name, label=label, info=info,
             category=f"{shape}|{color}|{info}", bbox=(x1, y1, x2, y2),
-            angle_deg=round(float(angle), 1),
-            # A1 旁路数据: 模型类名颜色 vs HSV 投票, 由 service 做冲突仲裁 (不影响对外字段)
-            diagnostics={"model_color": model_color, "hsv_color": hsv_color,
-                         "color_source": self.color_source})
+            angle_deg=round(float(angle), 1))
+        # A1 旁路数据: 模型类名颜色 vs HSV 投票, 由 service 做冲突仲裁 (不影响对外字段)
+        # A4 追加: category_core + QR 解码器/耗时/预算标记。svc-gate 的 A2 也会往同一 dict 写,
+        #          所以统一用 update() 合并, 不整键覆盖。
+        tgt.diagnostics.update({
+            "model_color": model_color, "hsv_color": hsv_color,
+            "color_source": self.color_source,
+            "category_core": f"{shape}|{color}|",
+            "qr_decoder": qr["decoder"], "qr_ms": round(float(qr["ms"]), 1),
+            "qr_attempted": bool(qr["attempted"]),
+            "qr_budget_exhausted": bool(qr["exhausted"] or self._qr_exhausted),
+        })
+        if template_set:
+            tgt.diagnostics["template_set"] = template_set
+        if info_missing:
+            tgt.diagnostics["info_missing"] = True
+        return tgt
 
     def _refine(self, frame, x1, y1, x2, y2, fallback, thin: bool = False):
         """
@@ -381,32 +446,101 @@ class YoloWorkpieceDetector(WorkpieceDetector):
                 color = "light_blue"
         return color
 
-    def _decode_qr(self, frame, x1, y1, x2, y2) -> str:
+    # A4: 多尺度 × 多预处理 (命中即停)
+    _QR_SCALES = (1, 2, 3)
+
+    def _qr_detector(self) -> Tuple[str, object]:
+        """惰性构造 QR 解码器 (A4)。
+
+        主路径 ``cv2.QRCodeDetectorAruco``, 不存在才回退 ``cv2.QRCodeDetector``。
+        **禁止**用 ``cv2.wechat_qrcode_WeChatQRCode()`` (属 opencv-contrib, 板上只有
+        opencv-python 4.11, 调它只会抛异常) —— 也不做静默降级: 实际用哪个解码器由调用方
+        写进 ``diagnostics["qr_decoder"]`` ("aruco"/"qrcode"/"none")。
+        """
+        if self._qr is None:
+            det, kind = None, "none"
+            cls = getattr(cv2, "QRCodeDetectorAruco", None)
+            if cls is not None:
+                try:
+                    det, kind = cls(), "aruco"
+                except Exception as e:            # 构造失败才回退, 不吞掉事实
+                    logger.warning("QRCodeDetectorAruco 构造失败 (%s), 回退 QRCodeDetector", e)
+            if det is None:
+                try:
+                    det, kind = cv2.QRCodeDetector(), "qrcode"
+                except Exception as e:
+                    logger.warning("QRCodeDetector 也不可用 (%s): 本次运行不做二维码解码", e)
+                    det, kind = None, "none"
+            self._qr = (kind, det)
+            logger.info("QR 解码器: %s", kind)
+        return self._qr
+
+    def _qr_images(self, crop):
+        """裁剪图 × {1×,2×,3×} × {原图, OTSU, 自适应阈值, CLAHE}, 命中即停 (A4)。"""
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        clahe = None
+        for s in self._QR_SCALES:
+            img = gray if s == 1 else cv2.resize(gray, None, fx=s, fy=s,
+                                                 interpolation=cv2.INTER_CUBIC)
+            yield img                                  # 1) 原图 (最便宜, 先试)
+            try:
+                _t, otsu = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                yield otsu                             # 2) OTSU 二值
+                yield cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                            cv2.THRESH_BINARY, 31, 5)     # 3) 自适应阈值
+                if clahe is None:
+                    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                yield clahe.apply(img)                 # 4) CLAHE
+            except Exception as e:
+                logger.debug("QR 预处理失败 (scale=%s): %s", s, e)
+
+    def _decode_qr(self, frame, x1, y1, x2, y2) -> Dict[str, object]:
+        """框内裁剪 → 多尺度 × 多预处理, 命中即停。返回解码结果字典 (A4)。
+
+        ``detect.qr_budget_ms`` 是**整次 scan** 的预算 (detect()/detect_multi() 入口由
+        ``_reset_qr_budget()`` 重置), 预算耗尽后本次 scan 内不再尝试解码。
+        返回 ``{text, ms, decoder, attempted, exhausted}``; 调用方把 decoder/ms/attempted/
+        exhausted 如实写进 ``diagnostics``。
+        """
+        out: Dict[str, object] = {"text": "", "ms": 0.0, "decoder": "none",
+                                  "attempted": False, "exhausted": bool(self._qr_exhausted)}
+        if self._qr_budget_left <= 0:            # 预算已耗尽 (含 qr_budget_ms=0)
+            self._qr_exhausted = True
+            out["exhausted"] = True
+            return out
         h, w = frame.shape[:2]
         pad = 10
         crop = frame[max(0, y1 - pad):min(h, y2 + pad), max(0, x1 - pad):min(w, x2 + pad)]
-        if crop.size == 0:
-            return ""
-        if self._qr is None:
+        if crop.size == 0 or min(crop.shape[:2]) < 16:
+            return out
+        kind, det = self._qr_detector()
+        out["decoder"] = kind
+        if det is None:                          # 没有可用解码器: 本次 scan 不再白试
+            self._qr_exhausted = True
+            out["exhausted"] = True
+            return out
+        out["attempted"] = True
+        t0 = time.perf_counter()
+        budget = self.qr_budget_ms if self.qr_budget_ms > 0 else self._qr_budget_left
+        for img in self._qr_images(crop):
+            used_ms = (time.perf_counter() - t0) * 1000.0
+            if used_ms >= budget or used_ms >= self._qr_budget_left:
+                out["exhausted"] = True
+                break
             try:
-                self._qr = ("wechat", cv2.wechat_qrcode_WeChatQRCode())
-            except Exception:
-                self._qr = ("cv", cv2.QRCodeDetector())
-        kind, det = self._qr
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        for img in (gray, cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)):
-            try:
-                if kind == "wechat":
-                    res, _ = det.detectAndDecode(img)
-                    if res:
-                        return str(res[0]).strip()
-                else:
-                    data, _, _ = det.detectAndDecode(img)
-                    if data:
-                        return str(data).strip()
-            except Exception:
-                pass
-        return ""
+                data = det.detectAndDecode(img)[0]
+            except Exception as e:
+                logger.debug("QR 解码异常 (%s): %s", kind, e)
+                data = ""
+            if data:
+                out["text"] = str(data).strip()
+                break
+        out["ms"] = round((time.perf_counter() - t0) * 1000.0, 1)
+        self._qr_budget_left = max(0.0, self._qr_budget_left - float(out["ms"]))
+        if out["exhausted"] or self._qr_budget_left <= 0:
+            self._qr_exhausted = True
+            out["exhausted"] = True
+        return out
 
     # ================================================================== 绘制
     def annotate(self, bgr_frame: np.ndarray, targets: List[VisionTarget]) -> np.ndarray:

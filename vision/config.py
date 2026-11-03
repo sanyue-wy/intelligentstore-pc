@@ -21,6 +21,9 @@
     IS_COLOR_SOURCE      hsv | model  (A1 颜色来源; 默认 hsv)
     IS_TRAY_WB           1/0         (A6 托盘白基准归一化; 默认关)
     IS_COMPETITION_LOCK  比赛锁文件路径 (默认 /tmp/is_competition.lock, 见 race_mode())
+    IS_REQUIRE_INFO      1/0       (A4 信息维度必填; 默认 0 = 旧行为)
+    IS_QR_BUDGET_MS      二维码解码时间预算 (A4; 按整次 scan 计, 默认 500; 0=不解码)
+    IS_REQUIRE_INFO_CONF 信息解不出时压到的置信度 (A4; 默认 0.43, 须 < COMMIT_CONF 0.45)
 """
 from __future__ import annotations
 
@@ -38,6 +41,9 @@ DEFAULT_CONFIG_PATH = os.path.join(CUR_DIR, "vision_config.json")
 
 DEFAULTS: Dict[str, Any] = {
     "backend": "yolo",
+    # A4 信息维度: true 时 category 第三段必须是可解出的信息 (classes.json 的 info / 二维码),
+    # 解不出写 "unknown" 并把置信度压到 detect.require_info_conf 触发抖料重扫。默认 false = 旧行为。
+    "require_info": False,
     "camera": {
         "type": "uvc", "device": 0, "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG",
         "serial": "", "path": "", "loop": True,
@@ -51,6 +57,10 @@ DEFAULTS: Dict[str, Any] = {
     "detect": {
         "refine": True, "decode_qr": True, "parallax_factor": 0.6,
         "min_area_px": 250, "max_area_px": 0, "roi": [], "edge_margin_px": 0,
+        # A4 QR 时间预算: 按「整次 scan」计 (不是每件); 0 = 本次 scan 完全不解码
+        "qr_budget_ms": 500,
+        # A4 require_info=true 且信息解不出时压到的置信度 (须 < COMMIT_CONF 0.45 才会抖料)
+        "require_info_conf": 0.43,
     },
     "scan": {"frames": 5, "skip_frames": 1, "min_hit_ratio": 0.5, "match_px": 25,
              "timeout_s": 3.0},
@@ -108,6 +118,7 @@ def _num(s: str):
 @dataclass
 class VisionConfig:
     backend: str = "yolo"
+    require_info: bool = False       # A4: 信息维度是否必填 (默认 false = 旧行为)
     camera: Dict[str, Any] = field(default_factory=dict)
     model: Dict[str, Any] = field(default_factory=dict)
     detect: Dict[str, Any] = field(default_factory=dict)
@@ -118,7 +129,8 @@ class VisionConfig:
     warnings: List[str] = field(default_factory=list)
 
     def as_dict(self) -> Dict[str, Any]:
-        return {"backend": self.backend, "camera": self.camera, "model": self.model,
+        return {"backend": self.backend, "require_info": self.require_info,
+                "camera": self.camera, "model": self.model,
                 "detect": self.detect, "scan": self.scan, "record": self.record,
                 "color": self.color}
 
@@ -173,6 +185,12 @@ def load_vision_config(path: Optional[str] = None) -> VisionConfig:
         col["source"] = env["IS_COLOR_SOURCE"].strip().lower()
     if env.get("IS_TRAY_WB"):
         col["tray_white_balance"] = env["IS_TRAY_WB"] not in ("0", "false", "False", "")
+    if env.get("IS_REQUIRE_INFO"):
+        merged["require_info"] = env["IS_REQUIRE_INFO"] not in ("0", "false", "False", "")
+    if env.get("IS_QR_BUDGET_MS"):
+        det["qr_budget_ms"] = _num(env["IS_QR_BUDGET_MS"])
+    if env.get("IS_REQUIRE_INFO_CONF"):
+        det["require_info_conf"] = float(env["IS_REQUIRE_INFO_CONF"])
 
     # 基本校验
     if not 0.05 <= float(mdl["conf"]) <= 0.95:
@@ -183,13 +201,20 @@ def load_vision_config(path: Optional[str] = None) -> VisionConfig:
     if col.get("source") not in ("hsv", "model"):
         warnings.append(f"color.source={col.get('source')!r} 无效 (只能是 hsv|model), 改为 hsv")
         col["source"] = "hsv"
+    if float(det.get("qr_budget_ms", 500) or 0) < 0:
+        warnings.append("detect.qr_budget_ms 不能为负, 改为 0 (本次 scan 不解码)")
+        det["qr_budget_ms"] = 0
+    if float(det.get("require_info_conf", 0.43) or 0) >= 0.45:
+        warnings.append("detect.require_info_conf >= COMMIT_CONF(0.45): 信息解不出时不会触发抖料重扫")
     roi = det.get("roi") or []
     if roi and (len(roi) < 3 or any(len(p) != 2 for p in roi)):
         warnings.append("detect.roi 需要 >=3 个 [u,v] 点, 已忽略")
         det["roi"] = []
     for w in warnings:
         logger.warning("视觉配置: %s", w)
-    return VisionConfig(backend=merged["backend"], camera=cam, model=mdl, detect=det,
+    return VisionConfig(backend=merged["backend"],
+                        require_info=bool(merged.get("require_info", False)),
+                        camera=cam, model=mdl, detect=det,
                         scan=scn, record=rec, color=col,
                         source=path if os.path.exists(path) else "(默认值)",
                         warnings=warnings)

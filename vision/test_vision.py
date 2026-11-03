@@ -744,5 +744,272 @@ class TestColorArbitration(unittest.TestCase):
             self.assertIn(c.get("color"), (None,) + tuple(cn), c)
 
 
+
+class TestInfoAndQr(unittest.TestCase):
+    """A4: 信息维度 (require_info) + QR 解码加强。全部用例端到端走 VisionService.scan()。
+
+    真 ReplayCamera + 真 YoloWorkpieceDetector, 只在实例上覆盖 `_infer` 注入 Detection、
+    或把 `det._qr` 换成假解码器 —— 不碰真实模型/相机, 也不需要 cv2 编出二维码
+    (板上无 opencv-contrib, cv2.QRCodeEncoder 不可用, 所以"命中"用假解码器证明流程)。
+    """
+
+    SHAPE = "hemisphere"
+    NAMES = ["红色半球", "蓝色半球"]
+    BOX = (100, 100, 200, 200)          # 红块 (HSV 投票 = red)
+    BOX2 = (400, 300, 500, 400)         # 远离 BOX, 融合后是第 2 个目标
+
+    class _StubEngine:
+        def __init__(self, names):
+            self.class_names = list(names)
+            self.is_ready = True
+            self.last_error = ""
+
+        def describe(self):
+            return "stub-info-engine"
+
+    class _FakeQR:
+        """假解码器: 记录真实调用次数, 第一次就"命中"; 可选每次调用耗时 (验证预算)。"""
+
+        def __init__(self, payload="QR-123", delay_s=0.0):
+            self.payload = payload
+            self.delay_s = delay_s
+            self.calls = 0
+
+        def detectAndDecode(self, img):
+            self.calls += 1
+            if self.delay_s:
+                time.sleep(self.delay_s)
+            return (self.payload, None, None)
+
+    def _setup(self, require_info=False, qr_budget_ms=500, classes_extra=None):
+        import cv2
+        import json
+        import os
+        import shutil
+        import tempfile
+        from vision.config import load_vision_config
+        from vision.interfaces import Detection
+        from vision.yolo_detector import YoloWorkpieceDetector
+
+        tmp = tempfile.mkdtemp(prefix="a4_info_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        frame = np.full((480, 640, 3), 40, np.uint8)
+        frame[100:200, 100:200] = (0, 0, 255)      # 红 (BGR)
+        cv2.imwrite(os.path.join(tmp, "frame.png"), frame)
+
+        cls = []
+        for i, n in enumerate(self.NAMES):
+            c = {"id": i, "name": n, "shape_cn": self.SHAPE, "color": None,
+                 "model_color": "red", "height_mm": 30}
+            c.update((classes_extra or {}).get(n) or {})
+            cls.append(c)
+        meta = {"color_names": {"red": "红色"},
+                "hsv": {"hue_bins": [["red", 0, 10], ["red", 170, 179]]},
+                "classes": cls}
+        meta_path = os.path.join(tmp, "classes.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        cfg_path = os.path.join(tmp, "vision_config.json")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump({"require_info": require_info,
+                       "record": {"enabled": False},
+                       "detect": {"qr_budget_ms": qr_budget_ms},
+                       "camera": {"type": "replay", "path": tmp, "fps": 60,
+                                  "loop": True, "stale_s": 5.0}},
+                      f, ensure_ascii=False, indent=2)
+        cfg = load_vision_config(cfg_path)
+        det = YoloWorkpieceDetector(engine=self._StubEngine(self.NAMES),
+                                    meta_path=meta_path, config=cfg)
+        svc = VisionService(MessageBus(), detector_factory=lambda cal: det,
+                            continuous_detect=False, config=cfg)
+        svc.start()
+        self.addCleanup(svc.stop)
+        self._det, self._Detection, self._tmp = det, Detection, tmp
+        return svc
+
+    def _detecting(self, name, conf=0.9, boxes=None):
+        D = self._Detection
+        boxes = boxes or [self.BOX]
+        self._det._infer = lambda frame: [D(0, name, conf, *b) for b in boxes]
+
+    def _scan(self, svc, n=2):
+        ts, _ref = svc.scan(n_frames=n, skip_frames=0)
+        self.assertTrue(ts, "scan() 应至少返回 1 个目标")
+        return ts
+
+    # ---------------------------------------------------------------- 预算
+    def test_qr_budget_zero_never_decodes(self):
+        """qr_budget_ms=0 -> 本 scan 完全不进解码循环, 但仍如实标 exhausted。"""
+        svc = self._setup(require_info=True, qr_budget_ms=0,
+                          classes_extra={"红色半球": {"decode_qr": True}})
+        fake = self._FakeQR()
+        self._det._qr = ("aruco", fake)
+        self._detecting("红色半球")
+        t = self._scan(svc)[0]
+        self.assertEqual(fake.calls, 0, "预算 0 时不该调用解码器")
+        self.assertFalse(t.diagnostics["qr_attempted"])
+        self.assertEqual(t.diagnostics["qr_ms"], 0.0)
+        self.assertTrue(t.diagnostics["qr_budget_exhausted"])
+        self.assertEqual(t.info, "unknown", "解不出信息必须是 unknown")
+        self.assertEqual(t.category, "hemisphere|red|unknown")
+        self.assertLess(t.confidence, 0.45, "require_info 解不出 -> 压到 COMMIT_CONF 以下")
+
+    def test_qr_budget_is_per_scan_not_per_item(self):
+        """预算按整次 scan 计: 第 1 个目标耗尽预算后, 同一次 scan 的第 2 个目标不再尝试。"""
+        svc = self._setup(qr_budget_ms=10, classes_extra={"红色半球": {"decode_qr": True}})
+        fake = self._FakeQR(delay_s=0.05)          # 每次调用 50ms >> 10ms 预算
+        self._det._qr = ("aruco", fake)
+        self._detecting("红色半球", boxes=[self.BOX, self.BOX2])
+        ts = self._scan(svc)
+        self.assertEqual(len(ts), 2, "两个相距很远的框应融合成 2 个目标")
+        self.assertEqual(fake.calls, 1, "预算耗尽后不再调用解码器")
+        self.assertTrue(ts[0].diagnostics["qr_attempted"])
+        self.assertTrue(ts[0].diagnostics["qr_budget_exhausted"])
+        self.assertFalse(ts[1].diagnostics["qr_attempted"], "同一次 scan 的后续目标不再尝试解码")
+        self.assertTrue(ts[1].diagnostics["qr_budget_exhausted"])
+
+    def test_budget_resets_next_scan(self):
+        """预算按 scan 重置: 下一次 scan 又能解码 (不是一次耗尽永久失效)。"""
+        svc = self._setup(classes_extra={"红色半球": {"decode_qr": True}})
+        fake = self._FakeQR()
+        self._det._qr = ("aruco", fake)
+        self._detecting("红色半球")
+        self._scan(svc)
+        self._scan(svc)
+        self.assertEqual(fake.calls, 2, "每次 scan 应重新获得预算")
+
+    # ---------------------------------------------------- 解码器如实上报
+    def test_missing_decoder_is_reported_not_silent(self):
+        """板上两个解码器都没有时: qr_decoder=none + attempted=False, 不许静默降级后假装试过。"""
+        svc = self._setup(require_info=True, classes_extra={"红色半球": {"decode_qr": True}})
+        self._det._qr = ("none", None)             # 模拟 cv2 里两个解码器都不可用
+        self._detecting("红色半球")
+        t = self._scan(svc)[0]
+        self.assertEqual(t.diagnostics["qr_decoder"], "none")
+        self.assertFalse(t.diagnostics["qr_attempted"])
+        self.assertTrue(t.diagnostics["qr_budget_exhausted"])
+        self.assertEqual(t.info, "unknown")
+
+    def test_decoder_name_is_recorded(self):
+        """真 cv2 解码器: diagnostics 必须写出实际用的那个 (aruco / qrcode / none), 不静默。"""
+        svc = self._setup(classes_extra={"红色半球": {"decode_qr": True}})
+        self._detecting("红色半球")
+        t = self._scan(svc)[0]
+        self.assertIn(t.diagnostics["qr_decoder"], ("aruco", "qrcode", "none"))
+        self.assertIsInstance(t.diagnostics["qr_ms"], float)
+        self.assertNotIn("wechat", str(t.diagnostics["qr_decoder"]))
+
+    # ---------------------------------------------------- info 声明/兼容
+    def test_info_dict_and_template_set(self):
+        """info 为 dict: text 作声明值, template_set 带进 diagnostics, 命中的码拼在后面。"""
+        svc = self._setup(classes_extra={"红色半球": {"info": {"text": "T1",
+                                                              "template_set": "S1",
+                                                              "decode_qr": True}}})
+        fake = self._FakeQR("QR-123")
+        self._det._qr = ("aruco", fake)
+        self._detecting("红色半球")
+        t = self._scan(svc)[0]
+        self.assertEqual(t.info, "T1:QR-123")
+        self.assertEqual(t.category, "hemisphere|red|T1:QR-123")
+        self.assertEqual(t.diagnostics["template_set"], "S1")
+        self.assertEqual(t.diagnostics["qr_decoder"], "aruco")
+        self.assertTrue(t.diagnostics["qr_attempted"])
+        self.assertEqual(fake.calls, 1, "命中即停: 只调一次解码器")
+
+    def test_legacy_top_level_decode_qr_still_works(self):
+        """兼容旧写法: info 里没有 decode_qr 时回退顶层 decode_qr。"""
+        svc = self._setup(classes_extra={"红色半球": {"info": {"text": "T2"},
+                                                      "decode_qr": True}})
+        fake = self._FakeQR("QR-999")
+        self._det._qr = ("aruco", fake)
+        self._detecting("红色半球")
+        t = self._scan(svc)[0]
+        self.assertEqual(t.info, "T2:QR-999")
+        self.assertEqual(fake.calls, 1)
+
+    def test_info_decode_qr_wins_over_top_level(self):
+        """info.decode_qr 优先: 显式 false 时, 即使顶层 decode_qr=true 也不解码。"""
+        svc = self._setup(require_info=True,
+                          classes_extra={"红色半球": {"info": {"text": "T3", "decode_qr": False},
+                                                      "decode_qr": True}})
+        fake = self._FakeQR()
+        self._det._qr = ("aruco", fake)
+        self._detecting("红色半球")
+        t = self._scan(svc)[0]
+        self.assertEqual(fake.calls, 0, "info.decode_qr=False 必须压过顶层 true")
+        self.assertEqual(t.info, "T3", "声明值已满足 require_info, 不该写成 unknown")
+        self.assertGreaterEqual(t.confidence, 0.45)
+        self.assertFalse(t.diagnostics["qr_attempted"])
+
+    def test_no_declaration_means_no_qr_attempt(self):
+        """没有任何 info/decode_qr 声明 -> 完全不碰二维码 (与 A1 及以前行为一致)。"""
+        svc = self._setup()
+        fake = self._FakeQR()
+        self._det._qr = ("aruco", fake)
+        self._detecting("红色半球")
+        t = self._scan(svc)[0]
+        self.assertEqual(fake.calls, 0)
+        self.assertFalse(t.diagnostics["qr_attempted"])
+        self.assertEqual(t.info, "")
+        self.assertEqual(t.category, "hemisphere|red|")
+
+    # ------------------------------------------------- require_info 语义
+    def test_require_info_satisfied_by_declaration(self):
+        svc = self._setup(require_info=True, classes_extra={"红色半球": {"info": {"text": "T4"}}})
+        self._detecting("红色半球")
+        t = self._scan(svc)[0]
+        self.assertEqual(t.info, "T4")
+        self.assertEqual(t.category, "hemisphere|red|T4")
+        self.assertGreaterEqual(t.confidence, 0.45, "信息解出时不该压置信度")
+        self.assertNotIn("info_missing", t.diagnostics)
+
+    def test_require_info_false_is_identical_to_a1(self):
+        """回归: require_info=false (默认) 时, 输出与 A1 逐字段一致 (info 保持空串, 不压置信度)。"""
+        svc = self._setup(require_info=False)
+        self._detecting("红色半球", conf=0.9)
+        t = self._scan(svc)[0]
+        self.assertEqual(t.info, "", "默认关时 info 必须还是空串 (不是 unknown)")
+        self.assertEqual(t.category, "hemisphere|red|")
+        self.assertEqual(t.confidence, 0.9, "默认关时绝不压置信度")
+        # 无颜色冲突 -> service 不重算 label, 保持 _build_target 的 classes.json name
+        self.assertEqual(t.label, "红色半球")
+        self.assertEqual(t.color, "red")
+        self.assertNotIn("info_missing", t.diagnostics)
+        self.assertFalse(t.diagnostics["qr_attempted"])
+
+    def test_require_info_unknown_keeps_three_segments(self):
+        """require_info=true 解不出 -> 第三段必须是 unknown 且仍是三段 (不许空串)。"""
+        svc = self._setup(require_info=True)
+        self._detecting("红色半球")
+        t = self._scan(svc)[0]
+        self.assertEqual(len(t.category.split("|")), 3)
+        self.assertEqual(t.category.split("|")[2], "unknown")
+        self.assertTrue(t.diagnostics["info_missing"])
+
+    # ---------------------------------------------------- category_core
+    def test_category_core_always_shape_color(self):
+        for req in (False, True):
+            with self.subTest(require_info=req):
+                svc = self._setup(require_info=req)
+                self._detecting("红色半球")
+                t = self._scan(svc)[0]
+                core = t.diagnostics["category_core"]
+                self.assertEqual(core, "hemisphere|red|")
+                self.assertEqual(core, "%s|%s|" % (t.shape, t.color))
+                self.assertEqual(core.count("|"), 2, "category_core 只有两段 + 尾随 |")
+                self.assertTrue(core.endswith("|"))
+                self.assertTrue(t.category.startswith(core))
+
+    def test_category_core_present_in_hsv_fallback(self):
+        """引擎不可用时 (HSV 回退) 每个目标也要有 category_core。"""
+        svc = self._setup()
+        self._det.engine.is_ready = False        # 走 _hsv_fallback
+        ts = self._scan(svc)
+        for t in ts:
+            self.assertEqual(t.diagnostics.get("category_core"), "%s|%s|" % (t.shape, t.color))
+
+
+
 if __name__ == "__main__":
     unittest.main()

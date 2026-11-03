@@ -121,16 +121,40 @@ class RunReport:
                                 "u": t.u_pixel, "v": t.v_pixel, "bbox": t.bbox,
                                 # A1: 旁路数据原样落盘 (颜色冲突/model_color/hsv_color...), 只加字段,
                                 # display_name 与 finish() 汇总逻辑不变。
-                                "diagnostics": dict(getattr(t, "diagnostics", None) or {})}
+                                "diagnostics": dict(getattr(t, "diagnostics", None) or {}),
+                                # A4: category 前两段 (形状|颜色|) 单独落盘, 复盘可按它聚合;
+                                # 与 category 一起给, 便于对比"信息段"是否解出。
+                                "category_core": (getattr(t, "diagnostics", None) or {}).get("category_core")
+                                                 or RunReport.core_of(t.category)}
                                for t in targets],
                               f, ensure_ascii=False, default=str)
             return name
         except Exception:
             return ""
 
+    @staticmethod
+    def core_of(category) -> str:
+        """取 category 的「形状|颜色|」两段 (A4)。不解析第三段信息, 只读汇总用。"""
+        parts = str(category or "").split("|")
+        return "|".join(parts[:2]) + "|" if len(parts) >= 2 else ""
+
+    def category_core_counts(self) -> Dict[str, int]:
+        """按 category_core 聚合本轮的件数 (A4)。
+
+        只读汇总, 不改比赛流程; item 里没有 category_core 时用 item["category"] 前两段推导
+        (UI/run_competition.py 未改, 它只传 category)。
+        """
+        out: Dict[str, int] = {}
+        for it in self.items:
+            core = it.get("category_core") or self.core_of(it.get("category"))
+            out[core] = out.get(core, 0) + 1
+        return out
+
     def finish(self, result: str, total_done: int, slots: Optional[dict] = None) -> None:
         self.data.update(result=result, total_done=total_done, end=time.strftime("%Y-%m-%d %H:%M:%S"),
                          elapsed_s=round(time.time() - self.t0, 1), slots=slots or {})
+        # A4: 按 category_core (形状|颜色|) 聚合的件数, 复盘核对"换颜色是否被当新类别"。
+        self.data["category_core_counts"] = self.category_core_counts()
         bus = _race_bus()
         if bus:
             from MessegeCenter.race import publish_state

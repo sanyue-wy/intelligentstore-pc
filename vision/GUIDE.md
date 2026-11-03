@@ -94,13 +94,15 @@ color_calib.py  现场 HSV 采样 -> 颜色区间        config.py  配置加载
 | `detect.roi` | 手动 ROI；托盘模式下留空即自动 |
 | `detect.min_area_px / max_area_px / edge_margin_px` | 过滤误检、贴边截断目标 |
 | `detect.parallax_factor` | 抓取高度 = 物体高度 × 该值（0.6 ≈ 上表面附近） |
+| `require_info` | **顶层**开关（默认 **false** = 旧行为）：true 时 `category` 第三段必须是解出的信息，解不出写 `unknown` 并压置信度触发抖料（A4，见 §7.2） |
+| `detect.qr_budget_ms` | 二维码解码时间预算（默认 500），按**整次 scan** 计；0 = 本次 scan 不解码（A4，见 §7.2） |
 | `scan.frames / min_hit_ratio / match_px` | 融合帧数 / 出现比例下限 / 匹配距离 |
 | `color.source` | `hsv`（默认：HSV 投票为权威，`classes.json` 的 `model_color` 只做冲突检测）/ `model`（应急：颜色直接用 `model_color`，**换颜色后就失效**，只用于板上 HSV 不可用时） |
 | `color.conflict_ttl_s / conflict_conf` | 冲突记忆 TTL（默认 60s）/ 比赛模式首次冲突把置信度压到的值（默认 0.43，须 < `COMMIT_CONF` 0.45，压下去才会触发一次抖料重扫） |
 | `color.tray_white_balance / wb_gain_min / wb_gain_max / wb_min_pixels` | 托盘白基准归一化（默认 **false**）；增益限幅 0.7~1.4；可用像素不足 200 时沿用上次增益。**只作用于颜色投票前的裁剪图，不改送模型的图**。`[现场待验证]` |
 | `record.enabled / dir / keep` | 每次 scan 存原图+标注图+json（`records/scans`），也是量化校准图来源 |
 
-环境变量临时覆盖：`IS_CAM_TYPE IS_CAM_DEVICE IS_CAM_SERIAL IS_CAM_REPLAY IS_CAM_W/H/FPS IS_CAM_EXPOSURE IS_CAM_GAIN IS_CAM_WB IS_YOLO_MODEL IS_YOLO_CONF IS_YOLO_IOU IS_PARALLAX_FACTOR IS_SCAN_FRAMES IS_VISION_RECORD IS_VISION_CONFIG IS_CAM_HEIGHT_MM IS_COLOR_SOURCE IS_TRAY_WB IS_COMPETITION_LOCK`。`IS_YOLO_CONF` 超出 0.05~0.95、`IS_YOLO_IOU` 超出 0.10~0.95 或不是数字时退回默认值，并写进自检问题（不会再静默检测全空）。颜色投票全落在 `hue_bins` 空隙时判 `unknown`，不再误判成 black。
+环境变量临时覆盖：`IS_CAM_TYPE IS_CAM_DEVICE IS_CAM_SERIAL IS_CAM_REPLAY IS_CAM_W/H/FPS IS_CAM_EXPOSURE IS_CAM_GAIN IS_CAM_WB IS_YOLO_MODEL IS_YOLO_CONF IS_YOLO_IOU IS_PARALLAX_FACTOR IS_SCAN_FRAMES IS_VISION_RECORD IS_VISION_CONFIG IS_CAM_HEIGHT_MM IS_COLOR_SOURCE IS_TRAY_WB IS_COMPETITION_LOCK IS_REQUIRE_INFO IS_QR_BUDGET_MS IS_REQUIRE_INFO_CONF`。`IS_YOLO_CONF` 超出 0.05~0.95、`IS_YOLO_IOU` 超出 0.10~0.95 或不是数字时退回默认值，并写进自检问题（不会再静默检测全空）。颜色投票全落在 `hue_bins` 空隙时判 `unknown`，不再误判成 black。
 
 ## 6. calib_config.json（`tray` 段）
 | 键 | 说明 |
@@ -128,7 +130,8 @@ DFOV 规格也能反算（`f = 对角像素/2 / tan(DFOV/2)`，100° 时 f@1920=
 - `color: null` = 颜色由 HSV 判（推荐：决赛换颜色不用重训）。
 - `model_color`: 类名里的颜色（如 `红色镂空立方体` → `red`），**只用于与 HSV 结果做冲突检测和界面提示，不参与 `category`**；无法判定填 `null`。
 - `shape_cn`: 形状英文键，是 `category` 的**第一段**（取值 `hollow_cube / tri_prism / hemisphere / cone / penta_prism / tetrahedron / cylinder`）。没有它才退回类名 —— 旧版本用类名当形状，`category` 会随模型颜色变化（现场 `蓝色半球|red|` 就是这条 bug）。
-- `decode_qr: true`：解码二维码，内容参与分类。
+- `info`（可选）：信息声明。字符串 = 直接当信息值；对象 = `{"qr": ..., "text": ..., "template_set": ..., "decode_qr": true|false}`（`text` 优先、`qr` 兜底作声明值，`template_set` 原样进 `diagnostics`）。
+- `decode_qr`：旧的顶层写法仍兼容 —— `info.decode_qr` 优先，其次回退顶层 `decode_qr`；**两者都没有就不解二维码**（与旧版本一致，不会凭空多花时间）。
 - 分类键 `category = 形状|颜色|信息`，相同才进同一盒；`label` 是大屏显示名（可用 `name` 覆盖）。
 - `thin_wall: true`：薄壁/空心件，颜色只取壁上像素，抓取点取外轮廓几何中心。
 - `hsv`：颜色区间，浏览器「颜色」页生成。
@@ -143,6 +146,15 @@ DFOV 规格也能反算（`f = 对角像素/2 / tan(DFOV/2)`，100° 时 f@1920=
 - 调试台「颜色」页/Scan 表格给三个按钮：**按 HSV**（把该组合记进冲突记忆，等同第二次自动采信）、**去颜色页重新采样**（跳颜色页并预选该颜色）、**本类强制颜色**（把 HSV 判定的颜色写进 `classes.json` 该类的 `color`；这是唯一写 `color` 的路径，写前备份 `.bak`，之后该类不再走 HSV 投票）。
 - 兜底：即使仲裁没生效，`MAX_UNCERTAIN_RETRY` 用尽后仍会抓取，不会结束本轮。
 
+
+### 7.2 信息维度与二维码（A4）
+- 默认 `require_info: false`：信息解不出时 `info` 保持 `""`、`category` 第三段为空 —— 与之前**逐字段一致**（有回归单测）。
+- `require_info: true`（顶层，或 `IS_REQUIRE_INFO=1`）：`category = 形状|颜色|信息`；信息解不出写 `"unknown"`（**不许空串、不许猜**），同时把该目标置信度压到 `detect.require_info_conf`（默认 0.43 < `COMMIT_CONF` 0.45）触发一次「抖料重扫」，并标 `diagnostics.info_missing=true`。
+- 解码器：主路径 `cv2.QRCodeDetectorAruco`，不存在才回退 `cv2.QRCodeDetector`。**不再用 `cv2.wechat_qrcode_WeChatQRCode()`**（属 opencv-contrib，板上只有 opencv-python 4.11），也**不做静默降级** —— 实际用了哪个如实写在每个目标的 `diagnostics.qr_decoder`（`aruco` / `qrcode` / `none`）。
+- 解码流程：框内裁剪（含 pad）→ 尺度 {1×, 2×, 3×} × 预处理 {原图, OTSU 二值, 自适应阈值, CLAHE}，**命中即停**。
+- 时间预算 `detect.qr_budget_ms`（默认 500，`IS_QR_BUDGET_MS` 覆盖）按**整次 scan** 计（不是每件）：耗尽后本次 scan 内不再尝试解码，每件写 `diagnostics.qr_ms` 与 `qr_budget_exhausted`；设 0 = 本次 scan 完全不解码。
+- `diagnostics.category_core = "形状|颜色|"`（两段 + 尾随 `|`）**每个目标都有**（走 HSV 回退的也有），供复盘按形状+颜色聚合；`records/runs/<时间>/scan_NNN.json` 里 `category_core` 与 `category` 同时给出，`report.json` 结束时多一份 `category_core_counts`。
+- **`classes.json` 目前没有填任何 `info` 值**：现场是否有二维码、码里是什么内容都还没验证，不能编造。要用时按上面格式填 `info` 并标 `[现场待验证]`。
 
 ## 8. 换模型 / 换相机 / 复现
 - 换模型：`.pt` 放进 `vision/models/` → `./convert.sh`（`tools/GUIDE.md`）。

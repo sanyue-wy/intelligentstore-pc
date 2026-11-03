@@ -8,9 +8,12 @@
     "detect.roi: 托盘区域多边形 [[u,v],...] (像素), 区域外的检测一律丢弃; [] = 不限制。用 vision_tool roi 交互生成。",
     "detect.edge_margin_px: 贴着画面边缘被截断的目标定位不准, 丢弃距边缘小于该值的框。",
     "record.enabled: 每次 scan 保存原图与标注图, 赛后复盘/补充训练数据。record.dir 相对路径按工程根目录 (宿主上持久保存, 也是一键转换的量化校准图来源)。",
-    "color 段见下 (A1 颜色来源/冲突仲裁, A6 托盘白基准)。"
+    "color 段见下 (A1 颜色来源/冲突仲裁, A6 托盘白基准)。",
+    "require_info: true 时 category 第三段必须是可解出的信息 (classes.json 的 info / 二维码), 解不出写 \"unknown\" 并把置信度压到 detect.require_info_conf 触发抖料重扫; 默认 false = 旧行为。",
+    "detect.qr_budget_ms: 二维码解码时间预算, 按整次 scan 计 (不是每件); 0 = 本次 scan 不解码。解码器/耗时/是否耗尽写在每个目标的 diagnostics 里。"
   ],
   "backend": "yolo",
+  "require_info": false,
   "camera": {
     "type": "uvc",
     "device": 0,
@@ -37,6 +40,8 @@
   "detect": {
     "refine": true,
     "decode_qr": true,
+    "qr_budget_ms": 500,
+    "require_info_conf": 0.43,
     "parallax_factor": 0.6,
     "min_area_px": 250,
     "max_area_px": 0,
