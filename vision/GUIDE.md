@@ -166,6 +166,7 @@ DFOV 规格也能反算（`f = 对角像素/2 / tan(DFOV/2)`，100° 时 f@1920=
 
 ### 7.4 托盘白基准归一化（A6，默认关）
 - **开关**：`color.tray_white_balance`（默认 `false`）；`IS_TRAY_WB=1` 可临时打开。调试台「颜色」页有对比勾选框（`仅本次` / `应用并保存`），旁边直接显示当前增益、白斑像素数与取样原因。
+- **`IS_*` 覆盖**：`IS_TRAY_WB=1/0` 开关；`IS_TRAY_WB_GAIN_MIN` / `IS_TRAY_WB_GAIN_MAX`（默认 0.7 / 1.4）、`IS_TRAY_WB_MIN_PIXELS`（默认 200）可临时改限幅与最少白斑像素，改完不必重启进程（每次 `load_vision_config()` 生效）。
 - **取样**：每次 scan 从**托盘内框**（自动检测四角 → `tray.fixed_px` → 手动/自动 `detect.roi`，都取不到就跳过）里挑「低饱和 `S <= hsv.white_s_max` + 高亮度 `V >= hsv.white_v_min` + **不在任何检测框内**」的像素（自实现白斑法，不引入 scipy/新依赖）。
 - **增益**：目标白亮度 = 白斑三通道均值，增益 = 目标 / 各通道均值，限幅 `color.wb_gain_min`(0.7) ~ `color.wb_gain_max`(1.4) 后缓存；白斑像素少于 `color.wb_min_pixels`(200) 时**沿用上次增益**，一只都没有就跳过。
 - **作用范围**：增益**只乘在颜色投票前的裁剪图**上；送模型的那张图、GrabCut 精定位用的原图都不动（单测逐像素断言）。所以它只影响 `color` 与 `category` 第二段。

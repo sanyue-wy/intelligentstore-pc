@@ -20,6 +20,9 @@
     IS_VISION_RECORD_DIR 保存目录
     IS_COLOR_SOURCE      hsv | model  (A1 颜色来源; 默认 hsv)
     IS_TRAY_WB           1/0         (A6 托盘白基准归一化; 默认关)
+    IS_TRAY_WB_GAIN_MIN  托盘白基准增益下限 (A6; 默认 0.7)
+    IS_TRAY_WB_GAIN_MAX  托盘白基准增益上限 (A6; 默认 1.4)
+    IS_TRAY_WB_MIN_PIXELS 托盘白基准最少白斑像素 (A6; 默认 200, 不足沿用上次增益)
     IS_COMPETITION_LOCK  比赛锁文件路径 (默认 /tmp/is_competition.lock, 见 race_mode())
     IS_REQUIRE_INFO      1/0       (A4 信息维度必填; 默认 0 = 旧行为)
     IS_QR_BUDGET_MS      二维码解码时间预算 (A4; 按整次 scan 计, 默认 500; 0=不解码)
@@ -190,6 +193,12 @@ def load_vision_config(path: Optional[str] = None) -> VisionConfig:
         col["source"] = env["IS_COLOR_SOURCE"].strip().lower()
     if env.get("IS_TRAY_WB"):
         col["tray_white_balance"] = env["IS_TRAY_WB"] not in ("0", "false", "False", "")
+    if env.get("IS_TRAY_WB_GAIN_MIN"):
+        col["wb_gain_min"] = _num(env["IS_TRAY_WB_GAIN_MIN"])
+    if env.get("IS_TRAY_WB_GAIN_MAX"):
+        col["wb_gain_max"] = _num(env["IS_TRAY_WB_GAIN_MAX"])
+    if env.get("IS_TRAY_WB_MIN_PIXELS"):
+        col["wb_min_pixels"] = int(float(env["IS_TRAY_WB_MIN_PIXELS"]))
     if env.get("IS_REQUIRE_INFO"):
         merged["require_info"] = env["IS_REQUIRE_INFO"] not in ("0", "false", "False", "")
     if env.get("IS_QR_BUDGET_MS"):

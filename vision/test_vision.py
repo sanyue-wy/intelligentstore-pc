@@ -1250,6 +1250,38 @@ class TestTrayWhiteBalance(unittest.TestCase):
                             "angle": t.angle_deg, "bbox": list(t.bbox)} for t in ts],
                           ensure_ascii=False, sort_keys=True, default=str)
 
+    # ---------------------------------------------------------------- IS_* 覆盖
+    def test_wb_env_overrides(self):
+        """IS_TRAY_WB / _GAIN_MIN / _GAIN_MAX / _MIN_PIXELS 覆盖配置段与 detector 属性。"""
+        import json
+        import os
+        from vision.config import load_vision_config
+        from vision.yolo_detector import YoloWorkpieceDetector
+
+        tmp, meta_path, _cfg, calib_path = self._files("a6_wb_env_")
+        env = {"IS_VISION_CONFIG": os.path.join(tmp, "vision_config.json"),
+               "IS_CALIB_CONFIG": calib_path,
+               "IS_TRAY_WB": "1",
+               "IS_TRAY_WB_GAIN_MIN": "0.8",
+               "IS_TRAY_WB_GAIN_MAX": "1.2",
+               "IS_TRAY_WB_MIN_PIXELS": "333"}
+        with unittest.mock.patch.dict(os.environ, env):
+            cfg = load_vision_config()
+            det = YoloWorkpieceDetector(CoordinateCalibrator(config_path=calib_path),
+                                        engine=self._StubEngine(self.NAMES),
+                                        meta_path=meta_path, config=cfg)
+        self.assertEqual(cfg.color["source"], "hsv")
+        self.assertTrue(cfg.color["tray_white_balance"])
+        self.assertEqual((cfg.color["wb_gain_min"], cfg.color["wb_gain_max"],
+                          cfg.color["wb_min_pixels"]), (0.8, 1.2, 333))
+        self.assertTrue(det.wb_enabled)
+        self.assertEqual((det.wb_gain_min, det.wb_gain_max, det.wb_min_pixels), (0.8, 1.2, 333))
+        self.assertEqual(det.wb_info()["min_pixels"], 333)
+        with unittest.mock.patch.dict(os.environ, dict(env, IS_TRAY_WB="0")):
+            cfg_off = load_vision_config()
+        self.assertFalse(cfg_off.color["tray_white_balance"])
+        self.assertEqual(cfg_off.color["wb_min_pixels"], 333)   # 限幅类覆盖不受开关影响
+
     # ---------------------------------------------------------------- 关闭 = 零影响
     def test_disabled_is_identical_to_baseline(self):
         """无 color 段 (A5 行为) 与显式 tray_white_balance=false 的 scan() 输出逐字段相同。"""
