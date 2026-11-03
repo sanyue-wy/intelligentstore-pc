@@ -19,6 +19,8 @@
     IS_VISION_RECORD     1/0  是否保存每次 scan 的原图+标注图
     IS_VISION_RECORD_DIR 保存目录
     IS_COLOR_SOURCE      hsv | model  (A1 颜色来源; 默认 hsv)
+    IS_CONFLICT_TTL_S    颜色冲突记忆 TTL 秒 (A1; 默认 60)
+    IS_CONFLICT_CONF     比赛模式首次冲突压到的置信度 (A1; 默认 0.43, 须 < COMMIT_CONF 0.45)
     IS_TRAY_WB           1/0         (A6 托盘白基准归一化; 默认关)
     IS_TRAY_WB_GAIN_MIN  托盘白基准增益下限 (A6; 默认 0.7)
     IS_TRAY_WB_GAIN_MAX  托盘白基准增益上限 (A6; 默认 1.4)
@@ -87,7 +89,8 @@ DEFAULTS: Dict[str, Any] = {
 }
 
 # 比赛模式的唯一判据 = 锁文件存在 (与 UI/run_competition.py 的 LOCK_FILE 一致)。
-# 全仓没有 IS_RACE, 不要新增; 其它模块一律调用 race_mode()。
+# 不要新增任何"比赛模式"的环境变量开关 (历史上讨论过的那个名字已废弃, 全仓不得再出现);
+# 其它模块一律调用 race_mode()。
 COMPETITION_LOCK = "/tmp/is_competition.lock"
 
 
@@ -199,6 +202,10 @@ def load_vision_config(path: Optional[str] = None) -> VisionConfig:
         col["wb_gain_max"] = _num(env["IS_TRAY_WB_GAIN_MAX"])
     if env.get("IS_TRAY_WB_MIN_PIXELS"):
         col["wb_min_pixels"] = int(float(env["IS_TRAY_WB_MIN_PIXELS"]))
+    if env.get("IS_CONFLICT_TTL_S"):
+        col["conflict_ttl_s"] = _num(env["IS_CONFLICT_TTL_S"])
+    if env.get("IS_CONFLICT_CONF"):
+        col["conflict_conf"] = _num(env["IS_CONFLICT_CONF"])
     if env.get("IS_REQUIRE_INFO"):
         merged["require_info"] = env["IS_REQUIRE_INFO"] not in ("0", "false", "False", "")
     if env.get("IS_QR_BUDGET_MS"):

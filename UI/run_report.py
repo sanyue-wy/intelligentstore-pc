@@ -8,7 +8,9 @@ report.json:
                  "result": "ok|grip_fail|fail|estop", "elapsed_s", "shot", "scan"}],
      "events": [{"t", "level", "msg"}],
      "slots":  {"1": {"label": "红色正方体", "count": 2}, ...},
-     "model":  "...", "warnings": [...]}
+     "model":  "...", "warnings": [...],
+     "category_core_counts": {"形状|颜色|": 件数, ...},
+     "color_conflict": {"by_detection": {...}, "by_piece": {...}}}   # A1.1 按类冲突率双口径
 网页调试台「复盘」页直接浏览; 识别错的那张一键归档到回归集 (dataset/regression)。
 
 同时把每轮状态/每件结果/事件旁路发布到消息总线 race/* (信息处理中心 RaceLedger 按赛规校验,
@@ -51,6 +53,14 @@ class RunReport:
                                      "elapsed_s": 0.0, "total_done": 0, "result": "进行中",
                                      "items": [], "events": [], "slots": {}, "model": model,
                                      "warnings": []}
+        # A1.1 颜色冲突双口径统计的旁路数据 (只读汇总; UI/run_competition.py 零改动):
+        #   口径① by_detection 按检测次数, 每次 scan 的每个目标都计入 (同一件被多次 scan 会重复计入);
+        #   口径② by_piece 按成功入盒件数, 每件只取它"被抓走前最后一次 scan"那个目标的 diagnostics。
+        self._scan_conflicts: Dict[str, int] = {"scans": 0, "targets": 0, "conflicts": 0}
+        self._scan_by_class: Dict[str, Dict[str, int]] = {}
+        self._last_scan_targets: List[dict] = []
+        self._piece_conflicts: Dict[str, int] = {"pieces": 0, "conflicts": 0, "unmatched": 0}
+        self._piece_by_class: Dict[str, Dict[str, int]] = {}
         self._lock = threading.Lock()
         try:
             os.makedirs(self.dir, exist_ok=True)
@@ -93,6 +103,9 @@ class RunReport:
                 pass
         with self._lock:
             self.items.append(kw)
+        if kw.get("result") == "ok":
+            # A1.1 口径②: 每件成功入盒时, 用「被抓走前最后一次 scan」的 diagnostics 记一次
+            self._note_piece(kw)
         self.save()
         bus = _race_bus()
         if bus:
@@ -115,6 +128,23 @@ class RunReport:
             if raw is not None:
                 cv2.imwrite(os.path.join(self.dir, f"scan_{idx:03d}_raw.jpg"), raw, [cv2.IMWRITE_JPEG_QUALITY, 92])
             if targets is not None:
+                roster = []
+                for t in targets:
+                    diag = dict(getattr(t, "diagnostics", None) or {})
+                    rec = {"u": float(getattr(t, "u_pixel", 0.0) or 0.0),
+                           "v": float(getattr(t, "v_pixel", 0.0) or 0.0),
+                           "class": str(getattr(t, "class_name", "") or ""),
+                           "label": str(getattr(t, "label", "") or ""),
+                           "category": str(getattr(t, "category", "") or ""),
+                           "conflict": bool(diag.get("color_conflict")),
+                           "model_color": diag.get("model_color"),
+                           "hsv_color": diag.get("hsv_color")}
+                    roster.append(rec)
+                    # A1.1 口径①: 按检测次数累计 (每次 scan 的每个目标)
+                    self._note_detection(rec["class"], rec["conflict"])
+                with self._lock:
+                    self._scan_conflicts["scans"] += 1
+                    self._last_scan_targets = roster
                 with open(os.path.join(self.dir, f"scan_{idx:03d}.json"), "w", encoding="utf-8") as f:
                     from UI.planner import display_name
                     json.dump([{"label": display_name(t), "category": t.category, "conf": t.confidence,
@@ -131,6 +161,83 @@ class RunReport:
             return name
         except Exception:
             return ""
+
+    # ------------------------------------------------------------ A1.1 按类颜色冲突率
+    def _note_detection(self, cls_name: str, conflict: bool) -> None:
+        """口径①: 按检测次数 (每次 scan 的每个目标) 累计, 按模型类名分开。"""
+        key = str(cls_name or "unknown")
+        with self._lock:
+            self._scan_conflicts["targets"] += 1
+            if conflict:
+                self._scan_conflicts["conflicts"] += 1
+            st = self._scan_by_class.setdefault(key, {"targets": 0, "conflicts": 0})
+            st["targets"] += 1
+            if conflict:
+                st["conflicts"] += 1
+
+    def _match_piece_target(self, kw: dict) -> Optional[dict]:
+        """口径②: 把入盒件匹配回「被抓走前最后一次 scan」里的那个目标。
+
+        `save_scan_image(targets=...)` 在 planner.pick_next 之前调用, 两者用的是同一批
+        targets, 所以 (u, v) 一般逐个精确相同 (容差 2px); 退化时按 category / label 就近匹配。
+        """
+        roster = self._last_scan_targets
+        if not roster:
+            return None
+        u, v = float(kw.get("u") or 0.0), float(kw.get("v") or 0.0)
+        best, best_d = None, None
+        for rec in roster:
+            d = abs(rec["u"] - u) + abs(rec["v"] - v)
+            if best_d is None or d < best_d:
+                best, best_d = rec, d
+        if best is not None and best_d is not None and best_d <= 2.0:
+            return best
+        for field in ("category", "label"):
+            want = str(kw.get(field) or "")
+            if not want:
+                continue
+            same = [r for r in roster if r[field] == want]
+            if same:
+                return min(same, key=lambda r: abs(r["u"] - u) + abs(r["v"] - v))
+        return None
+
+    def _note_piece(self, kw: dict) -> None:
+        """口径②: 只统计成功入盒件 (result == ok), 每件一次。"""
+        rec = self._match_piece_target(kw)
+        with self._lock:
+            if rec is None:
+                self._piece_conflicts["unmatched"] += 1
+                return
+            key = rec["class"] or "unknown"
+            self._piece_conflicts["pieces"] += 1
+            st = self._piece_by_class.setdefault(key, {"pieces": 0, "conflicts": 0})
+            st["pieces"] += 1
+            if rec["conflict"]:
+                self._piece_conflicts["conflicts"] += 1
+                st["conflicts"] += 1
+
+    def color_conflict_report(self) -> Dict[str, Any]:
+        """按类颜色冲突率汇总, **双口径** (A1.1; 只读)。
+
+        口径① `by_detection`: 按检测次数 (同一件被多次 scan 重复计入);
+        口径② `by_piece`:     按成功入盒件数 (每件取被抓走前最后一次 scan 的 diagnostics)。
+        两个口径都以口径②为准核对"分类判定是否受颜色冲突影响"。
+        """
+        def _rate(st: Dict[str, int], a: str, b: str) -> float:
+            n = int(st.get(b, 0) or 0)
+            return round(int(st.get(a, 0) or 0) / n, 4) if n else 0.0
+
+        det = dict(self._scan_conflicts)
+        det["rate"] = _rate(det, "conflicts", "targets")
+        det["by_class"] = {c: dict(s, rate=_rate(s, "conflicts", "targets"))
+                           for c, s in sorted(self._scan_by_class.items())}
+        pie = dict(self._piece_conflicts)
+        pie["rate"] = _rate(pie, "conflicts", "pieces")
+        pie["by_class"] = {c: dict(s, rate=_rate(s, "conflicts", "pieces"))
+                           for c, s in sorted(self._piece_by_class.items())}
+        return {"by_detection": det, "by_piece": pie,
+                "note": "口径① 按检测次数(同一件多次 scan 重复计入); "
+                        "口径② 按成功入盒件数(每件取被抓走前最后一次 scan 的 diagnostics), 以口径②为准"}
 
     @staticmethod
     def core_of(category) -> str:
@@ -155,6 +262,8 @@ class RunReport:
                          elapsed_s=round(time.time() - self.t0, 1), slots=slots or {})
         # A4: 按 category_core (形状|颜色|) 聚合的件数, 复盘核对"换颜色是否被当新类别"。
         self.data["category_core_counts"] = self.category_core_counts()
+        # A1.1: 按类颜色冲突率, 双口径 (① 检测次数 / ② 成功入盒件数)
+        self.data["color_conflict"] = self.color_conflict_report()
         bus = _race_bus()
         if bus:
             from MessegeCenter.race import publish_state

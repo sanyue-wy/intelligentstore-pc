@@ -103,7 +103,7 @@ color_calib.py  现场 HSV 采样 -> 颜色区间        config.py  配置加载
 | `color.tray_white_balance / wb_gain_min / wb_gain_max / wb_min_pixels` | 托盘白基准归一化（默认 **false**）；增益限幅 0.7~1.4；可用像素不足 200 时沿用上次增益。**只作用于颜色投票前的裁剪图，不改送模型的图**。`[现场待验证]` |
 | `record.enabled / dir / keep` | 每次 scan 存原图+标注图+json（`records/scans`），也是量化校准图来源 |
 
-环境变量临时覆盖：`IS_CAM_TYPE IS_CAM_DEVICE IS_CAM_SERIAL IS_CAM_REPLAY IS_CAM_W/H/FPS IS_CAM_EXPOSURE IS_CAM_GAIN IS_CAM_WB IS_YOLO_MODEL IS_YOLO_CONF IS_YOLO_IOU IS_PARALLAX_FACTOR IS_SCAN_FRAMES IS_VISION_RECORD IS_VISION_CONFIG IS_CAM_HEIGHT_MM IS_COLOR_SOURCE IS_TRAY_WB IS_COMPETITION_LOCK IS_REQUIRE_INFO IS_QR_BUDGET_MS IS_REQUIRE_INFO_CONF IS_MATCH_RATIO IS_MATCH_PX_MIN`。`IS_YOLO_CONF` 超出 0.05~0.95、`IS_YOLO_IOU` 超出 0.10~0.95 或不是数字时退回默认值，并写进自检问题（不会再静默检测全空）。颜色投票全落在 `hue_bins` 空隙时判 `unknown`，不再误判成 black。
+环境变量临时覆盖：`IS_CAM_TYPE IS_CAM_DEVICE IS_CAM_SERIAL IS_CAM_REPLAY IS_CAM_W/H/FPS IS_CAM_EXPOSURE IS_CAM_GAIN IS_CAM_WB IS_YOLO_MODEL IS_YOLO_CONF IS_YOLO_IOU IS_PARALLAX_FACTOR IS_SCAN_FRAMES IS_VISION_RECORD IS_VISION_CONFIG IS_CAM_HEIGHT_MM IS_COLOR_SOURCE IS_CONFLICT_TTL_S IS_CONFLICT_CONF IS_TRAY_WB IS_TRAY_WB_GAIN_MIN IS_TRAY_WB_GAIN_MAX IS_TRAY_WB_MIN_PIXELS IS_COMPETITION_LOCK IS_REQUIRE_INFO IS_QR_BUDGET_MS IS_REQUIRE_INFO_CONF IS_MATCH_RATIO IS_MATCH_PX_MIN`。`IS_YOLO_CONF` 超出 0.05~0.95、`IS_YOLO_IOU` 超出 0.10~0.95 或不是数字时退回默认值，并写进自检问题（不会再静默检测全空）。颜色投票全落在 `hue_bins` 空隙时判 `unknown`，不再误判成 black。
 
 ## 6. calib_config.json（`tray` 段）
 | 键 | 说明 |
@@ -147,6 +147,8 @@ DFOV 规格也能反算（`f = 对角像素/2 / tan(DFOV/2)`，100° 时 f@1920=
 - 调试台「颜色」页/Scan 表格给三个按钮：**按 HSV**（把该组合记进冲突记忆，等同第二次自动采信）、**去颜色页重新采样**（跳颜色页并预选该颜色）、**本类强制颜色**（把 HSV 判定的颜色写进 `classes.json` 该类的 `color`；这是唯一写 `color` 的路径，写前备份 `.bak`，之后该类不再走 HSV 投票）。
 - 兜底：即使仲裁没生效，`MAX_UNCERTAIN_RETRY` 用尽后仍会抓取，不会结束本轮。
 
+
+- **复盘字段（A1.1）**：`report.json` 多一份 `color_conflict`，按类冲突率**双口径** —— `by_detection` 按检测次数（同一件被多次 scan 会重复计入）、`by_piece` 按成功入盒件数（每件只取它被抓走前最后一次 scan 的 diagnostics，匹配方式：先按 `(u,v)` 精确匹配，退化时按 `category`/`label` 就近，匹配不上的计入 `by_piece.unmatched`）；**以 `by_piece` 为准**。`IS_CONFLICT_TTL_S` / `IS_CONFLICT_CONF` 可临时改冲突记忆 TTL 与首次冲突压到的置信度。
 
 ### 7.2 信息维度与二维码（A4）
 - 默认 `require_info: false`：信息解不出时 `info` 保持 `""`、`category` 第三段为空 —— 与之前**逐字段一致**（有回归单测）。

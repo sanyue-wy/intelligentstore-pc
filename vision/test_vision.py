@@ -1389,5 +1389,98 @@ class TestTrayWhiteBalance(unittest.TestCase):
         self.assertIsNone(det._tray_region())
 
 
+class TestConflictReport(unittest.TestCase):
+    """A1.1: report.json 的按类颜色冲突率「双口径」汇总 + IS_CONFLICT_* 覆盖。
+
+    口径① by_detection = 检测次数 (同一件多次 scan 重复计入);
+    口径② by_piece     = 成功入盒件数 (每件取被抓走前最后一次 scan 的 diagnostics)。
+    """
+
+    def _report(self):
+        import shutil
+        import tempfile
+        from UI.run_report import RunReport
+
+        tmp = tempfile.mkdtemp(prefix="a11_report_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with unittest.mock.patch("UI.run_report._race_bus", lambda: None):
+            return RunReport(base=tmp)
+
+    @staticmethod
+    def _img():
+        return np.zeros((8, 8, 3), np.uint8)
+
+    @staticmethod
+    def _t(u, v, cls, conflict, category="hemisphere|red|", label="红色半球"):
+        import types
+
+        return types.SimpleNamespace(target_id=1, color="red", shape="hemisphere",
+                                     class_name=cls, label=label, category=category,
+                                     confidence=0.9, u_pixel=u, v_pixel=v, bbox=(0, 0, 1, 1),
+                                     diagnostics={"color_conflict": True, "model_color": "yellow",
+                                                  "hsv_color": "red"} if conflict
+                                     else {"model_color": "red", "hsv_color": "red"})
+
+    def test_dual_scope_conflict_rates(self):
+        """同一批目标: 口径① 按检测次数, 口径② 按成功入盒件数, 两者基数不同。"""
+        rep = self._report()
+        # scan1: 红色半球冲突 + 蓝色半球正常
+        rep.save_scan_image(self._img(), 1, targets=[
+            self._t(100, 100, "红色半球", True),
+            self._t(300, 300, "蓝色半球", False, category="hemisphere|blue|", label="蓝色半球")])
+        # scan2: 同一位置两件都正常 (只影响口径①)
+        rep.save_scan_image(self._img(), 2, targets=[
+            self._t(100, 100, "红色半球", False),
+            self._t(300, 300, "蓝色半球", False, category="hemisphere|blue|", label="蓝色半球")])
+        self.assertEqual(rep.item(seq=1, label="红色半球", category="hemisphere|red|", conf=0.9,
+                                  u=100, v=100, result="ok")["seq"], 1)
+        # scan3: 红色半球又冲突 -> 第 2 件入盒时取这次 (最后一次 scan)
+        rep.save_scan_image(self._img(), 3, targets=[self._t(100, 100, "红色半球", True)])
+        rep.item(seq=2, label="红色半球", category="hemisphere|red|", conf=0.9, u=100, v=100, result="ok")
+        # 匹配不上的件
+        rep.item(label="白色半球", category="hemisphere|white|", conf=0.9, u=999, v=999, result="ok")
+        # 失败的件不计入口径②
+        rep.item(label="红色半球", category="hemisphere|red|", conf=0.9, u=100, v=100, result="fail")
+        rep.finish("完成", 2)
+
+        cc = rep.data["color_conflict"]
+        det, pie = cc["by_detection"], cc["by_piece"]
+        self.assertEqual(det["scans"], 3)
+        self.assertEqual((det["targets"], det["conflicts"]), (5, 2))
+        self.assertEqual(det["rate"], 0.4)
+        self.assertEqual(det["by_class"]["红色半球"], {"targets": 3, "conflicts": 2, "rate": 0.6667})
+        self.assertEqual(det["by_class"]["蓝色半球"], {"targets": 2, "conflicts": 0, "rate": 0.0})
+        self.assertEqual((pie["pieces"], pie["conflicts"], pie["unmatched"]), (2, 1, 1))
+        self.assertEqual(pie["rate"], 0.5)
+        self.assertEqual(pie["by_class"]["红色半球"], {"pieces": 2, "conflicts": 1, "rate": 0.5})
+        self.assertIn("口径②", cc["note"])
+
+    def test_piece_scope_takes_last_scan_before_pickup(self):
+        """口径② 只看「被抓走前最后一次 scan」: scan1 冲突、scan2 不冲突 -> 该件不算冲突。"""
+        rep = self._report()
+        rep.save_scan_image(self._img(), 1, targets=[self._t(100, 100, "红色半球", True)])
+        rep.save_scan_image(self._img(), 2, targets=[self._t(100, 100, "红色半球", False)])
+        rep.item(seq=1, label="红色半球", category="hemisphere|red|", conf=0.9, u=100, v=100, result="ok")
+        rep.finish("完成", 1)
+        cc = rep.data["color_conflict"]
+        self.assertEqual(cc["by_detection"]["conflicts"], 1)          # 口径① 记到 scan1 那次冲突
+        self.assertEqual(cc["by_detection"]["targets"], 2)
+        self.assertEqual(cc["by_piece"]["pieces"], 1)
+        self.assertEqual(cc["by_piece"]["conflicts"], 0)              # 口径② 取 scan2 -> 不冲突
+        self.assertEqual(cc["by_piece"]["by_class"]["红色半球"]["conflicts"], 0)
+
+    def test_conflict_env_overrides(self):
+        """IS_CONFLICT_TTL_S / IS_CONFLICT_CONF 覆盖 color 段 (硬规则 6)。"""
+        import os
+        from vision.config import load_vision_config
+
+        env = {"IS_CONFLICT_TTL_S": "7", "IS_CONFLICT_CONF": "0.31"}
+        with unittest.mock.patch.dict(os.environ, env):
+            cfg = load_vision_config()
+        self.assertEqual(cfg.color["conflict_ttl_s"], 7)
+        self.assertEqual(cfg.color["conflict_conf"], 0.31)
+        self.assertEqual(cfg.warnings, [])
+
+
 if __name__ == "__main__":
     unittest.main()
