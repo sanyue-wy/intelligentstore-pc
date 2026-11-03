@@ -77,3 +77,17 @@
 - 背景：新固件把运动/抓取交给 `User/APP/app.c` 业务层，到达取件位后只停在"等 PERMIT"，**不再置 `RES_FLAGS bit2 (PICK=0x04)`**；旧版上位机 `execute_sorting_task_ex` 死等 0x04 必然 12s 超时。
 - 改动：`communication/client.py` 在等待到达取件位的循环中新增兜底——机械臂运动到目标附近（默认5mm）并稳定一段时间（默认1s）即视为到位并下发 `PERMIT`；报警/急停/有 error 锁存时绝不误发。可用 `PERMIT_FALLBACK=0` 关闭。逻辑仅新增、不改原有 PICK 路径（固件修好后仍走原生路径）。
 - 测试：`communication/test_permit_fallback.py` 5 用例（兜底生效/关闭超时/故障不误发/目标远不误发/原生PICK回归）；全套 70 用例 OK。
+
+
+## 视觉优化（A1–A8：视觉侧的参数化与门禁）
+- 新增模块：`vision/limits.py`（越界拦截唯一判据：像素/托盘/机械臂三套坐标一起判，闭区间；
+  现场标定没填 `robot_limits_mm` 就**不检查**）、`vision/gates.py`（11 项门禁 + `ref_points_fp` 指纹，
+  调试 warn / 比赛 fail，每项可用 `gates.<id>` 覆盖成 `off|warn|fail`；`python3 -m vision.gates --check`）。
+- 行为开关全部走配置，不写死：`vision_config.json` 的 `color.source / color.tray_white_balance / require_info /
+  detect.qr_budget_ms / detect.require_info_conf / detect.parallax_factor_thin / scan.match_ratio / scan.match_px_min`；
+  `calib_config.json` 的 `robot_limits_mm / tray_margin_mm / tray_margin_action / gates / gate_thresholds`；
+  `classes.json` 的 `model_color / info / proj_h_mm`。每项都能用 `IS_*` 环境变量临时覆盖。
+- 模块边界没动：`communication/**` 零改动，`UI/**` 只动了 `UI/run_report.py`（只加字段），
+  `vision/interfaces.py` 与 `VisionTarget` 原 16 字段名/语义不变（只在末尾加了 `diagnostics: dict`）。
+- 测试入口：`vision.test_vision_gates`（门禁/限位 28 例）+ `tools.test_convert_model`（部署门禁 39 例）
+  已加入 README 的测试循环。逐项说明与原始输出见 `REFACTOR_REPORT.md` 的「视觉优化」各节。

@@ -175,6 +175,7 @@ DFOV 规格也能反算（`f = 对角像素/2 / tan(DFOV/2)`，100° 时 f@1920=
 - **开关**：`color.tray_white_balance`（默认 `false`）；`IS_TRAY_WB=1` 可临时打开。调试台「颜色」页有对比勾选框（`仅本次` / `应用并保存`），旁边直接显示当前增益、白斑像素数与取样原因。
 - **`IS_*` 覆盖**：`IS_TRAY_WB=1/0` 开关；`IS_TRAY_WB_GAIN_MIN` / `IS_TRAY_WB_GAIN_MAX`（默认 0.7 / 1.4）、`IS_TRAY_WB_MIN_PIXELS`（默认 200）可临时改限幅与最少白斑像素，改完不必重启进程（每次 `load_vision_config()` 生效）。
 - **取样**：每次 scan 从**托盘内框**（自动检测四角 → `tray.fixed_px` → 手动/自动 `detect.roi`，都取不到就跳过）里挑「低饱和 `S <= hsv.white_s_max` + 高亮度 `V >= hsv.white_v_min` + **不在任何检测框内**」的像素（自实现白斑法，不引入 scipy/新依赖）。
+- **限幅可达性（实测口径）**：默认 `hsv.white_s_max=45` 只允许白斑三通道差落在约 ±17.6% 内，真实增益天然只有约 `[0.94, 1.14]`；`0.7~1.4` 的极端值只在人为造偏色时出现（离场实测 `[1.105,1.0,0.913]`，极端造偏色时恰被夹到 `[0.7,1.367,1.4]`，白斑像素 14862）。**要让 0.7~1.4 的限幅真正起作用，必须同时放宽 `hsv.white_s_max`**（代价：有色件会被当成白斑取样），否则「限幅 0.7~1.4」是空承诺。`[现场待验证]`
 - **增益**：目标白亮度 = 白斑三通道均值，增益 = 目标 / 各通道均值，限幅 `color.wb_gain_min`(0.7) ~ `color.wb_gain_max`(1.4) 后缓存；白斑像素少于 `color.wb_min_pixels`(200) 时**沿用上次增益**，一只都没有就跳过。
 - **作用范围**：增益**只乘在颜色投票前的裁剪图**上；送模型的那张图、GrabCut 精定位用的原图都不动（单测逐像素断言）。所以它只影响 `color` 与 `category` 第二段。
 - **关掉 = 零影响**：`tray_white_balance=false` 时不取样、不写 `diagnostics`，`scan()` 输出与 A5 逐字段一致（单测有 JSON diff 断言）。
@@ -182,7 +183,7 @@ DFOV 规格也能反算（`f = 对角像素/2 / tan(DFOV/2)`，100° 时 f@1920=
 - **`[现场待验证]`**：0.7~1.4 的限幅、`wb_min_pixels=200`、以及"白斑三通道均值"这个目标亮度都是经验值，现场必须实测确认；现场光照稳定后更推荐直接锁 `camera.exposure_us/gain_db/wb_kelvin`（见 A3 门禁 `imaging_locked`）而不是依赖本功能。
 
 ## 8. 换模型 / 换相机 / 复现
-- 换模型：`.pt` 放进 `vision/models/` → `./convert.sh`（`tools/GUIDE.md`）。
+- 换模型：`.pt` 放进 `vision/models/` → `./convert.sh`（`tools/GUIDE.md` §1.1 有部署门禁表：`calib_max_images`(200) / `calib_min_images`(20) / `cosine_min`(0.99) / `consistency_min`(0.85)；不达标**默认不部署**，退出码 3 + 打印 `仍在使用上一版模型: <path>`，`vision/models/` 一个文件都不动，`--force` 才强行上线）。
 - 换工业相机：`"camera": {"type": "hikrobot", ...}`；其它品牌实现 `VisionCamera` 并 `register_camera()`。
 - 复现现场：`python3 tools/vision_tool.py web --replay records/scans/raw`。
 

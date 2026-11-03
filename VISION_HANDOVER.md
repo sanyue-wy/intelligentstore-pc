@@ -379,3 +379,40 @@ mv old/<旧模型名>* . && touch <旧模型名>.pt   # 旧的拿回来，touch 
 cd $P && ./is.sh precheck                    # 确认模型名是旧的
 ```
 
+
+
+## 10. 视觉优化新增能力（对应调试台与现场清单）
+
+这一节只列"现场会遇到、且以前没有"的东西，逐项的默认值与关闭方式见 `REFACTOR_REPORT.md`「视觉优化」节；
+现场执行顺序与合格标准见 `FIELD_VERIFICATION_CHECKLIST.md` 的 B2→B3→B4→B1→B5→B6→B7。
+
+1. **开工前 30 秒体检**：`python3 -m vision.gates --check`（或 `./is.sh gates`）列出 11 项门禁结论。
+   调试状态只提醒、比赛状态（`/tmp/is_competition.lock` 存在）拦截：不过就**拒绝启动**（进程非零退出，
+   不会掉进 `start_competition.sh` 的 2 秒重启循环）。要让某一项只提醒不拦，把它写进
+   `calib_config.json` 的 `gates`（例如 `"gates": {"robot_limits": "warn"}`）。
+2. **成像锁没锁**：`camera.exposure_us / gain_db / wb_kelvin` 三项必须**都不是 null**，
+   且颜色页采样写出的 `hsv.imaging_fp` 要和当前 `vision_config.json` 的相机段一致（改动四项任一 → 判过期）。
+   这是"颜色投票可复现"的前提，也是 B2 的验收点。
+3. **参考点盖章**：参考点配好后在参考点页保存，会写出 `ref_points_fp` 指纹（四角 + 内参 + 分辨率 +
+   `fixed_z_mm` + `axes` + `origin_mm`）。指纹**只比内容不比时间**（板子可能没有 RTC）；
+   以后改这六项任一 → 门禁直接报"参考点已过期"。
+4. **限位拦截**：`calib_config.json` 填 `robot_limits_mm{x_min,x_max,y_min,y_max}`（不填 = 不检查，门禁提醒）。
+   填了以后：扫描时越界目标**不进**发送序列（日志 `视觉限位拦截: …`，与"不是空盘"事件文字可区分），
+   调试台"点哪去哪"与 `/comm` MOVE 走同一个检查函数，越界时 HTTP 返回 `{"ok":false,...}` 且**一个字节都不发出**。
+   只保证上位机不发越界目标，**不修**下位机驱动器/固件 `参数超限`/串口重枚举。
+5. **冲突仲裁**：`classes.json` 的 `model_color` 与 HSV 投票不一致时（现场证据：黄色四面体被投成 blue/red），
+   调试台用洋红标注、`diagnostics` 记 `{model_color, hsv_color}`，比赛模式第一次把置信度压到 0.43
+   触发一次抖料重扫、同组合第二次起采信 HSV。颜色不对就在颜色页重新采样，或按 HSV 结果改 `classes.json`。
+6. **多帧融合半径自适应**：`scan.match_ratio`(0.35) × 框短边、下限 `match_px_min`(12)。大件/小件混线时不再
+   一张盘上分不开或重复计数；要退回旧行为设 `match_ratio: 0`（用固定 `match_px`）。
+7. **信息维度（二维码）**：`require_info=false` 时行为与以前一致；要按信息分盒时先把 `classes.json` 每类的
+   `info{decode_qr,…}` 填好、做通信息链，**再**把 `require_info` 置 true（顺序不可颠倒，理由见 B6.2）。
+   `detect.qr_budget_ms`(500) 是整次 scan 的预算，超了就不再尝试（`diagnostics.qr_ms`）。
+8. **抓取高度语义**：`pixel_to_robot(u,v,h)` 的 h 是**投影平面高度**（不是下潜深度/夹持高度）。
+   某类量到真实值后填 `classes.json` 的 `proj_h_mm`（优先）或改 `height_mm`；薄壁件另用
+   `detect.parallax_factor_thin`。老经验值 `parallax_factor=0.6` 标 `[现场待验证]`。
+9. **托盘白基准归一化**：默认关（`color.tray_white_balance=false`），关掉时对现有输出零影响。
+   注意其 0.7~1.4 限幅在默认 `hsv.white_s_max=45` 下实际很窄（见 `vision/GUIDE.md` §7.4 的实测口径）。
+10. **换模型有门禁**：`./convert.sh` 默认"不达标不部署"（余弦 <0.99 或 BPU/ONNX 一致率 <0.85 就退出码 3、
+    打印 `仍在使用上一版模型: <path>`，`vision/models/` 一个文件都不动；`--force` 才强行上线）。
+    阈值在 `tools/convert_config.json`（见 `tools/GUIDE.md` §1.1）。

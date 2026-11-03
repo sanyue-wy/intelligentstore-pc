@@ -424,3 +424,220 @@ SCRIPT_EXIT2=0
 **现场待验证**：`[现场待验证]` 实机 `ref_points_fp` 盖章后的数值、以及曝光/增益/白平衡锁定量；
 `class_height` 逐类高度真值只能回实验室量；颜色页采样后写出的 `hsv.imaging_fp` 在实机照明下
 是否一次就与 `vision_config.json` 的 camera 段一致（本机是用合成相机验证的读写同源）。
+
+---
+
+## 视觉优化（A1–A8）总述
+
+本节按《视觉优化执行计划（4）》(v5, 2026-11-03) 的 A 阶段逐项收口。基线 `17d8c98`，全部改动在
+`视觉A*:` 前缀的 commit 里，**未改 `communication/**`，`UI/**` 只动了 `UI/run_report.py`（只加字段）**，
+`vision/interfaces.py` 与 `VisionTarget` 原 16 字段名/语义一字未动（只在末尾新增
+`diagnostics: dict = field(default_factory=dict)`）。
+
+**原则**：所有阈值/开关都进配置文件并支持 `IS_*` 环境变量覆盖，没有写死在代码里；
+现场没实测过的一律标 `[现场待验证]`，报告里不出现编造的实测数字。
+
+### A1 category 第一段取错（形状位置放的是带颜色的模型类名）
+- **问题**：`_build_target()` 用 `shape = meta.get("shape", d.name)`，而 `classes.json` 只有 `shape_cn`
+  → 取到模型类名。现场证据：`records/runs/20261102_024845/report.json` 的
+  `"category": "黄色四面体|blue|"`、`records/runs/20261102_024718/scan_003.json` 的 `"黄色四面体|red|"`。
+- **改了什么**：`vision/yolo_detector.py` 改为 `meta["shape_cn"] or meta["shape"] or d.name`（23 类的
+  category 第一段现在都等于 `shape_cn`）；新增 `model_color_of()` 与 `color_source` 读取；
+  `classes.json` 23 类全部补 `model_color`（现场 HSV 标定值逐字节未动，`color` 仍为 null）；
+  `diagnostics` 记 `{model_color, hsv_color, color_source}`；调试台冲突用洋红标注；
+  `vision/service.py` 新增 `_apply_color_conflict()`：记忆键 `shape|model_color|hsv_color`（**不用位置**）、
+  TTL 60s、比赛模式同一组合首次把置信度压到 `conflict_conf` 触发一次抖料重扫、第二次起采信 HSV。
+- **新增配置（默认）**：`color.source="hsv"`、`color.conflict_ttl_s=60`、`color.conflict_conf=0.43`。
+- **怎么关**：把 `color.source` 设成 `model`（应急：颜色直接用 `model_color`，换颜色即失效）；
+  不想压置信度就把 `color.conflict_conf` 设 `≥ COMMIT_CONF(0.45)`（不做抖料，只告警）；
+  整套冲突提示在调试模式（无锁文件）本来就只 WARNING。
+- **有意行为变化**：`UI/planner.py:_closest_slot()` 用 `category.split("|")[0]` 做同形状归并，
+  修好 shape 后"同形状不同颜色"现在会归到同一槽位（改前不会）。已写进本报告，未改 planner。
+- **证据**：`/tmp/A1_evidence.txt`、`/tmp/A1_unittest.txt`（vision 40 OK）、
+  `/tmp/A1_e2e.txt`（`新类别 tetrahedron|blue|`、`颜色冲突: 类=黄色四面体 … 键=tetrahedron|yellow|red`）。
+
+### A1.1 冲突率双口径（D4）
+- **改了什么**：`UI/run_report.py` 增 `data["color_conflict"]`，两个口径分开算：
+  ①`by_detection`＝按"检测到的目标"计（在 `save_scan_image()` 累计）；②`by_piece`＝按"实际抓取的件"计
+  （在 `item(result="ok")` 用 `_match_piece_target()` 先按 `|du|+|dv| <= 2.0` 匹配该件被抓走前最后一次
+  scan 的目标名册，退化再按 category/label 就近），并附 `note` 说明两个口径的差别。
+- **新增配置（默认）**：`color.conflict_ttl_s=60`、`color.conflict_conf=0.43`（`IS_CONFLICT_TTL_S` /
+  `IS_CONFLICT_CONF` 可临时改）。
+- **怎么关**：同 A1（`conflict_conf ≥ 0.45` 时两份计数都恒为 0 冲突）。
+- **证据**：e2e 实测 `by_detection {scans 3, targets 4, conflicts 1, rate 0.25}`、
+  `by_piece {pieces 3, conflicts 0, unmatched 0}`（4/25 分之差正是"同一件被多帧重复记"的口径差）。
+- 顺带清理：`IS_RACE` 措辞清除（`grep -rn IS_RACE` 排除 `records/` 后零命中），比赛判据统一走
+  `vision.config.race_mode()` + 锁文件。
+
+### A4 信息维度 + 二维码加强
+- **改了什么**：`classes.json` 每类可选 `info{qr,text,template_set,decode_qr}`（兼容旧的顶层
+  `decode_qr`，`info.decode_qr` 优先）；`vision_config.json` 新增顶层 `require_info`；`_decode_qr` 重写：
+  删掉 `cv2.wechat_qrcode_WeChatQRCode()`（属 opencv-contrib，板上没有），主路径 `cv2.QRCodeDetectorAruco`
+  → 回退 `cv2.QRCodeDetector`，实际解码器如实写 `diagnostics.qr_decoder`(aruco/qrcode/none)；
+  流程为 框内裁剪 → {1×,2×,3×} × {原图, OTSU, 自适应阈值, CLAHE} 命中即停；
+  `category_core`（`形状|颜色|`）每个目标都有（含 HSV 兜底路径）；
+  `UI/run_report.py` 的 `scan_NNN.json` 同时写 `category_core` 与 `category`，`finish()` 汇总
+  `category_core_counts`。
+- **新增配置（默认）**：`require_info=false`（`IS_REQUIRE_INFO`）、`detect.qr_budget_ms=500`
+  （按**整次 scan** 计，`IS_QR_BUDGET_MS`）、`detect.require_info_conf=0.43`（`IS_REQUIRE_INFO_CONF`）。
+- **怎么关**：`require_info=false` 时行为与优化前逐字段一致（有回归断言：`info==""`、
+  `category=="形状|颜色|"`、无 `info_missing`）；`detect.qr_budget_ms=0` 则本次 scan 完全不解码。
+- **未编造**：`classes.json` 本项**没改**（现场是否贴码、码里是什么内容没有实测 → 不填假值），
+  `vision/GUIDE.md` §7.2 只写填写格式并标 `[现场待验证]`。
+- **证据**：`/tmp/A4_unittest.txt`（vision 54 OK，`TestInfoAndQr` 14/14）、`/tmp/A4_e2e.txt`。
+
+### A4.1 解码顺序按置信度 + HSV 兜底的信息语义
+- **改了什么**：新增 `_qr_plan(frame, dets)`——**只把配了 `decode_qr` 的目标当候选**，按 `(-conf, 原序)`
+  排序依次解码，预算整次 scan 共享、命中即停；`_build_target(..., qr_override=None)` 新增可选参数，
+  返回顺序/`target_id`/`hits` 不变。HSV 兜底路径：`require_info=true` 时 info 为 `unknown`、
+  category 仍是三段、置信度 ≤ `require_info_conf`（会触发抖料）；`false` 时与基类逐字段相同。
+- **怎么关**：同 A4。
+- **为什么**：这两条是计划原文的明确要求（line 172 与 line 99/D4），verifier 在 A4 首次提交时
+  独立发现未实现（反例：先解 conf=0.30 的目标、conf=0.95 的反而 `attempted=False`），本项补齐。
+
+### A5 多帧融合匹配半径自适应
+- **改了什么**：`detect_multi()` 的固定半径改为 `max(match_px_min, match_ratio × min(框宽, 框高))`；
+  匹配保持**类无关**（"同类优先"只作近距离 tie-breaker，不作硬过滤）；`min_hits` 语义不变。
+- **新增配置（默认）**：`scan.match_ratio=0.35`、`scan.match_px_min=12`（`IS_MATCH_RATIO` /
+  `IS_MATCH_PX_MIN`）；`match_ratio <= 0` 时退回旧的固定 `match_px`（默认 25）。
+- **怎么关**：`scan.match_ratio: 0`（完全回到旧行为）。
+- **证据**：`/tmp/A5_unittest.txt`、`/tmp/A5_e2e.txt`；verifier 独立复现 80px 框→28.0px、300px→105.0px、
+  20px→12.0px、ratio=0→25.0px；中心距 60px/框 80px 保持 2 目标；15px 抖动合并为 1；
+  5 帧中 2 帧 A / 3 帧 B → 取多数 B。
+
+### A6 / A6.1 托盘白基准颜色归一化（默认关）
+- **改了什么**：每次 scan 从托盘内框取「低饱和 `S <= hsv.white_s_max` + 高亮度 `V >= hsv.white_v_min`
+  + 不在任何检测框内」的像素，自实现白斑法（约 30 行，**不引入 scipy/新依赖**）算三通道增益，
+  限幅后**只乘在颜色投票前的裁剪图上**；送模型的图与 GrabCut 精定位用的原图逐像素不动（有断言）。
+  增益 = 白斑三通道均值 / 各通道均值，限幅 `wb_gain_min~wb_gain_max`，白斑像素不足则沿用上次增益
+  （`reason=too_few_pixels`），托盘找不到就跳过（`no_tray`，正常出目标）。
+- **新增配置（默认）**：`color.tray_white_balance=false`、`wb_gain_min=0.7`、`wb_gain_max=1.4`、
+  `wb_min_pixels=200`（`IS_TRAY_WB` / `IS_TRAY_WB_GAIN_MIN|MAX|MIN_PIXELS`，A6.1 补的后三个）。
+- **怎么关 / 零影响**：默认就是关；关掉时不取样、不写任何 `wb_*` 诊断键，`scan()` 输出与 A5 树
+  逐字段一致（单测 JSON diff 断言，剔除 timestamp）。
+- **⚠ 限幅可达性（实测口径，必须一起看）**：默认 `hsv.white_s_max=45` 只允许白斑三通道差落在约 ±17.6% 内，
+  真实增益天然只有约 `[0.94, 1.14]`；`0.7~1.4` 的极端值只在人为造偏色时出现（离场实测 `[1.105,1.0,0.913]`、
+  极端造偏色被夹到 `[0.7,1.367,1.4]`、白斑像素 14862）。**要让限幅真正起作用必须同时放宽
+  `hsv.white_s_max`**（代价：有色件会被当白斑），否则"限幅 0.7~1.4"是空承诺。已写进
+  `vision/GUIDE.md` §7.4 与 `FIELD_VERIFICATION_CHECKLIST.md` 补充项 3。
+- **证据**：`/tmp/A6_unittest.txt`、`/tmp/A6_e2e.txt`、`/tmp/A6_1_evidence.txt`；verifier 在
+  `f033dcc`/`ed15b93` 树上独立复现全部断言。
+- **`[现场待验证]`**：0.7~1.4 限幅、`wb_min_pixels=200`、"白斑三通道均值"这个目标亮度都是经验值；
+  现场光照稳定后更推荐直接锁 `camera.exposure_us/gain_db/wb_kelvin`（门禁 `imaging_locked`）而不是依赖本功能。
+
+### A7 / A7.1 模型转换部署门禁
+- **改了什么**：部署判定抽成纯函数 `decide(cfg, metrics) -> DeployDecision`；阈值优先级
+  内置默认 < `tools/convert_config.json` < 环境变量 < 命令行。**修掉了真正的风险**：原 `main()` 的
+  step4/step5 会**立刻** `sync_classes()` + `retire_old_models()` + 覆盖 `onnx_dst`
+  （640x480 相机下恰好与在用的 `best_1027_640x480.onnx` 同名），判定不通过时会留下
+  "旧模型已移走、新模型没上线"的空档；现在所有写入推迟到判定通过之后，候选 `.bin` 先落
+  `tools/build/<prefix>/new.bin`。校准图上限 50→200，有 `dataset/hard_cases` 时按类轮询优先抽取、
+  最少 20 张保留；余弦 <0.99 或 BPU/ONNX 一致率 <0.85 默认**不部署**。
+- **新增配置（默认）**：`tools/convert_config.json` 的 `calib_max_images=200`、`calib_min_images=20`、
+  `cosine_min=0.99`、`consistency_min=0.85`、`hard_cases_dir=dataset/hard_cases`、
+  `regression_dir=dataset/regression`（`IS_CALIB_MAX` / `IS_CALIB_MIN` / `IS_COSINE_MIN` /
+  `IS_CONSISTENCY_MIN`）。
+- **怎么关**：只对"不部署"这一条来说，`--force` 绕过余弦/一致率（但**不绕过** `.bin` 装载失败）；
+  `--dry-run` 全程只读。
+- **不部署时的可见行为**：退出码 **3**、打印 `仍在使用上一版模型: <path>`、
+  `vision/models/` 一个文件都不动、不产生 `models/old/`。
+- **证据**：`/tmp/a7_evidence.txt`（179 行）：`best_1027_640x480.bin`(sha256 `7b2f4c80…`, mtime
+  2026-10-29 16:34:31, 3412884 B) / `.onnx`(`d8c91377…`, 16:19:38, 12091246 B) / `.json`(`8c66238d…`)
+  在判定前后逐字节相同，`cv2.dnn.readNetFromONNX` 仍成功（229 层 23 类）；
+  6 组 dry-run（余弦 0.98→不部署、0.995+一致率 0.90→部署、0.10+`--force`→部署、一致率 0.80→不部署、
+  `IS_COSINE_MIN=0.5`→部署、`=0.999`→不部署）。测试 `tools.test_convert_model` 39 例。
+- **`[现场待验证]`**：`--assume-cosine/--assume-consistency` 是模拟值（板上无 ultralytics/hb_mapper，
+  真值要等一次真编译）；`dataset/hard_cases`、`dataset/regression` 板上**不存在**
+  （`dataset/` 只有 `calib_images_20261029/` 60 张），两条分支已实现+单测覆盖"目录不存在也照常工作"
+  但无真跑；回归项还依赖 onnxruntime（板上缺，走优雅降级）。
+- 已知小瑕疵（保留现状）：`load_remote_cfg()` 会把 `convert_config.json` 的所有非 `_` 键读进远端配置
+  dict 再全量写回，新门禁键被一并搬进远程配置（值不变、无害）。
+
+### A8 抓取高度语义
+- **改了什么**：明确 `_build_target()` 传给 `pixel_to_robot(u,v,h)` 的 h 是**投影平面高度**
+  （不是下潜深度/夹持高度）。优先级：`classes.json` 的 `proj_h_mm`（填了直接用） >
+  `thin_wall ? parallax_factor_thin` > `height_mm × parallax_factor`；`diagnostics` 记实际用的
+  `proj_h_mm` 与实际 `parallax_factor`。`vision/GUIDE.md` 新增 §7.5 写清语义（老经验值 0.6 标 `[现场待验证]`）。
+- **新增配置（默认）**：`detect.parallax_factor_thin=null`（`IS_PARALLAX_FACTOR_THIN`）；
+  `classes.json` 可选 `proj_h_mm`。
+- **怎么关**：不填 `proj_h_mm`、`parallax_factor_thin` 留 null 时，行为与优化前一致（`height_mm × parallax_factor`）。
+- **未编造**：`classes.json` 未改（现场没有实测高度 → 不填假值，23 类仍都是占位 30mm，门禁 `class_height` 会报）。
+- **证据**：`/tmp/A8_unittest.txt`（vision 84 OK，含 6 例 `TestProjectionHeight`）、`/tmp/A8_e2e.txt`。
+
+### 视觉优化新增配置总览（默认值 / 怎么关闭）
+
+| 配置文件 | 键 | 默认 | 关闭 / 退回旧行为 |
+|---|---|---|---|
+| `vision_config.json` | `color.source` | `"hsv"` | 设 `"model"`（应急） |
+| | `color.conflict_ttl_s` / `color.conflict_conf` | `60` / `0.43` | `conflict_conf ≥ 0.45` → 不压置信度 |
+| | `color.tray_white_balance` / `wb_gain_min` / `wb_gain_max` / `wb_min_pixels` | `false` / `0.7` / `1.4` / `200` | 默认就是关（关掉零影响） |
+| | `require_info` | `false` | 默认就是关 |
+| | `detect.qr_budget_ms` / `detect.require_info_conf` | `500` / `0.43` | `0` = 本次 scan 不解码 |
+| | `detect.parallax_factor_thin` | `null` | 留 null = 与旧行为一致 |
+| | `scan.match_ratio` / `scan.match_px_min` | `0.35` / `12` | `match_ratio: 0` → 用固定 `match_px` |
+| `calib_config.json` | `robot_limits_mm` | `null`（不检查） | 不填 = 不拦截（调试够用，比赛门禁会提醒） |
+| | `tray_margin_mm` / `tray_margin_action` | `null` / `"warn"` | 不填 = 不做托盘外拦截 |
+| | `gates.<id>` | 未写＝调试 warn / 比赛 fail | 每项可单独 `off`/`warn`/`fail` |
+| | `gate_thresholds` | 计划默认（2mm/4mm/0.97~1.03…） | 现场超差又暂时重标不了时显式放宽 |
+| | `ref_points_fp` | 无（= 未标定） | `./is.sh gates --seal` 盖章写入 |
+| `classes.json` | `model_color` | 已按现有 23 类填 | 仅冲突检测用，不决定 `category` |
+| | `info{...}` / `proj_h_mm` | 未填 | 不填＝不启用信息维度 / 用 `height_mm × factor` |
+| `tools/convert_config.json` | `calib_max_images` / `calib_min_images` / `cosine_min` / `consistency_min` | `200` / `20` / `0.99` / `0.85` | `--force` 绕过余弦/一致率 |
+
+### 最终验收（Lead 在最终 HEAD 上实测，原始输出 `/tmp/lead_final_acceptance.txt`、`/tmp/lead_final_acceptance2.txt`）
+
+1. **八个 unittest 模块**：`vision.test_vision` OK / `vision.test_vision_gates` Ran 28 OK /
+   `MessegeCenter.test_bus` Ran 4 OK / `moniter.test_monitor` Ran 3 OK / `communication.test_comm` Ran 12 OK /
+   `UI.test_ui` Ran 9 OK / `webui.test_webui` Ran 6 OK / `tools.test_convert_model` Ran 39 OK。旧测试一个没删。
+2. **现场配置自检**：`ok = False | problems = 11`，包含计划要求的 6 项（参考点未标定缺 `ref_points_fp`、
+   颜色未标定缺 `imaging_fp`、类别高度 23/23 都是 30.0mm、成像未锁定 `exposure_us/gain_db/wb_kelvin=null`、
+   无 `camera_matrix/dist_coeffs`、机械臂限位未配置），**不是"问题=无"**。
+3. **门禁两级**：无锁（调试）`通过 3 / 提醒 7 / 拦截 1`、退出码 1 但只打印不阻止；
+   有锁（比赛）`通过 3 / 提醒 4 / 拦截 4`（`ref_points`/`fit_quality`/`imaging_locked`/`color_imaging`）。
+4. **有锁拒绝启动**：真实 `python3 UI/run_competition.py` → `LOCKED_EXIT=1`，traceback 落点
+   `UI/run_competition.py:282 boot() → vision/service.py:170 start() → _enforce_gates() →
+   RuntimeError: 比赛模式 (存在锁文件 /tmp/is_competition.lock) 视觉门禁不通过, 拒绝启动: …`；
+   删锁后同一条命令 `PIPE_EXIT=0`，`成功 3 件, 用时 19.5s`，`1 号盒: 蓝色四面体 x3`。
+5. **全达标配置放行**（`/tmp/fullpass/{vision_config,calib_config,classes}.json` + 锁）：
+   `gates --check` → `通过 10 / 提醒 1 / 拦截 0`、退出码 0；真实入口 `FULLPASS_UI_EXIT=0`、
+   `成功 3 件, 用时 19.6s`。
+6. **每项门禁可单独 `off|warn|fail`**（现场配置副本 + 锁）：8 条不达标项全设 `off`→exit 0、
+   全设 `warn`→exit 0、全设 `fail`→exit 1；**本身达标的 3 项（`ref_collinear`/`pose`/`cam_self`）设 `fail`
+   仍 exit 0**（不会误拦）；把唯一 warn 项 `residual_poly` 升级成 `fail` 才正确拦截（exit 1）。
+7. **指纹只比内容不比时间**：全达标配置改四角 → `[FAIL] ref_points 参考点已过期: 指纹 9dab9f6bfb4b !=
+   当前 ac61489dfb7e (四角/内参/分辨率/fixed_z_mm/axes/origin_mm 改过)`、exit 1；
+   只改 `ref_points_verified_at` 时间戳 → 指纹不变、exit 0。
+8. **越界拦截端到端**（svc-gate 用 PTY 假串口逼出真实发送路径，`/tmp/a2_goto_evidence.txt` 等）：
+   `goto_reject` → 上位机发出 **0 字节 / 0 个 MOTION 帧**，HTTP `{"ok":false,...,"error":"机械臂限位拦截
+   (指令未下发): …"}`；`goto_pass` 对照 → 96 B / 1 个 MOTION `[MOTION] task_id=201 目标=(126.440,63.400)mm`；
+   `/comm` MOVE 同理（越界 0 字节、放行 32 B）。扫描路径：越界 run 有 `视觉限位拦截: …` 6 行 +
+   "不是空盘"提示 + `scan_NNN.json` 全 `[]` + 取件命令 0 行；基线 run 正常 3 件。
+9. **`start_competition.sh` 门禁路径**（容器内实测）：门禁不过 → `SCRIPT_EXIT=1` 且**不进 while 重启循环**；
+   无锁 → `SCRIPT_EXIT2=0` 并成功 3 件。
+
+### 已知问题与边界（必须和上面的结论一起看）
+
+- **`09b054a`(A5) 单树边界红**：该 commit 的 `vision/test_vision.py:622` 引用了后续 A3 才存在的
+  `VisionService._enforce_gates`，单独 checkout 它跑 `vision.test_vision` 是
+  `Ran 60 FAILED(errors=8)`（该属性在 `76d00c8` 落地后即闭合，最终 HEAD 全绿）。
+  这是**已知边界问题、不是功能缺陷**：规则"每个 commit 前跑全部测试"当时是在含 A3 的工作区上满足的。
+  未做历史重写，理由：`test_vision.py` 被 A1/A5/A6/A6.1/A1.1 反复修改，rebase 冲突风险高于收益；
+  最终判据取最终 HEAD 的全绿结果（本报告第 1 条）。
+- **`76d00c8`(A2) 提交里包含现场未提交的标定状态**：该 commit 的 `vision/calib_config.json` diff 相对
+  基线 `17d8c98` 除 A2 新键外还带上现场工作区原有的 3 个参考点、新四角（74.6,87.1 / 403.7,6.9 /
+  629.4,243.4 / 65.4,411.9）与 `perspective:"auto"`（基线里是更早的一套四角 163.48,129.54 / 455.22,115.68 /
+  591.28,352.19 / 83.26,417.61）。也就是说**现场那套标定数据现在进了 git**（好事：不会再丢），
+  代价是这套 3 点拟合 scale=0.9783、平均 2.83mm、最大 4.23mm **超默认阈值**，
+  所以比赛模式现在起不来（`fit_quality` 在 debug/race 都是 fail）——现场要么重标，要么显式放宽
+  `gate_thresholds`。这与 A3 的验收要求一致，已写进 `FIELD_VERIFICATION_CHECKLIST.md`。
+- **越界拦截的边界声明**：只保证**上位机不把越界目标/坐标放进发送序列**；
+  **不声称**修复下位机驱动器故障、固件 `参数超限` 判定、`ACM0→ACM1` 重枚举。
+- **D3 现场历史（11-02 01:06 "参数超限"）**：被拒的到底是 XY 还是速度参数 → **无法确认**
+  （没有对应 run 目录、scan json 里没有 mm 坐标、日志零命中；实测 `参数超限` 全部落在
+  11-01 16:27–16:31）。不编结论。
+- **`[现场待验证]` 汇总**：见 `FIELD_VERIFICATION_CHECKLIST.md` 末尾"签字前的未闭环项确认"
+  （B0.2/B2/B2 采样/B3/B4/B1/B5.1/B5.2/B5.3/B6.1/B6.2/B6.3/B7 全部未闭环）+ 补充 3 条
+  （A7 的 `dataset/hard_cases|regression` 不存在、计划中字段的最终落名、A6 限幅可达性）。
+- **验证者复核**：`verifier` 对每个 `视觉A*` commit 做了独立只读复核（越界扫描、禁用依赖 grep、
+  重跑模块与 e2e、关键断言独立复现），证据 `/tmp/verify_evidence.md`；A1/A7 通过，A4 曾报两处偏差
+  （已由 A4.1 补齐）、A5 报的 commit 边界红即上面第 1 条，A2/A6 通过。

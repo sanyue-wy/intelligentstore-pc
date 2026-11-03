@@ -99,7 +99,7 @@ records/        运行时生成: scans/(每次扫描) runs/(每轮报告)
 ## 7. 测试
 
 ```bash
-for m in vision.test_vision MessegeCenter.test_bus moniter.test_monitor communication.test_comm UI.test_ui webui.test_webui; do python3 -m unittest $m; done
+for m in vision.test_vision vision.test_vision_gates MessegeCenter.test_bus moniter.test_monitor communication.test_comm UI.test_ui webui.test_webui tools.test_convert_model; do python3 -m unittest $m; done
 ALLOW_MOCK=1 USE_SYNTHETIC_CAM=1 START_SOURCES=auto ONESHOT=1 EXPECTED_TOTAL=3 python3 UI/run_competition.py   # 无硬件全流程
 ```
 
