@@ -24,6 +24,8 @@
     IS_REQUIRE_INFO      1/0       (A4 信息维度必填; 默认 0 = 旧行为)
     IS_QR_BUDGET_MS      二维码解码时间预算 (A4; 按整次 scan 计, 默认 500; 0=不解码)
     IS_REQUIRE_INFO_CONF 信息解不出时压到的置信度 (A4; 默认 0.43, 须 < COMMIT_CONF 0.45)
+    IS_MATCH_RATIO       多帧融合匹配半径比例 (A5; 默认 0.35)
+    IS_MATCH_PX_MIN      多帧融合匹配半径下限 px (A5; 默认 12)
 """
 from __future__ import annotations
 
@@ -63,6 +65,9 @@ DEFAULTS: Dict[str, Any] = {
         "require_info_conf": 0.43,
     },
     "scan": {"frames": 5, "skip_frames": 1, "min_hit_ratio": 0.5, "match_px": 25,
+             # A5 匹配半径自适应: 半径 = max(match_px_min, match_ratio × min(框宽, 框高));
+             # match_ratio <= 0 时退回旧的固定 match_px (service.scan() 仍在传该参数)
+             "match_ratio": 0.35, "match_px_min": 12,
              "timeout_s": 3.0},
     "record": {"enabled": True, "dir": "records/scans", "keep": 300},
     "color": {
@@ -191,6 +196,10 @@ def load_vision_config(path: Optional[str] = None) -> VisionConfig:
         det["qr_budget_ms"] = _num(env["IS_QR_BUDGET_MS"])
     if env.get("IS_REQUIRE_INFO_CONF"):
         det["require_info_conf"] = float(env["IS_REQUIRE_INFO_CONF"])
+    if env.get("IS_MATCH_RATIO"):
+        scn["match_ratio"] = _num(env["IS_MATCH_RATIO"])
+    if env.get("IS_MATCH_PX_MIN"):
+        scn["match_px_min"] = _num(env["IS_MATCH_PX_MIN"])
 
     # 基本校验
     if not 0.05 <= float(mdl["conf"]) <= 0.95:

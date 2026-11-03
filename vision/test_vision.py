@@ -615,6 +615,13 @@ class TestColorArbitration(unittest.TestCase):
                                     meta_path=meta_path, config=cfg)
         svc = VisionService(MessageBus(), detector_factory=lambda cal: det,
                             continuous_detect=False, config=cfg)
+        # A3 (svc-gate) 起把"比赛模式启动前的现场门禁"加进了 VisionService.start(): 锁文件存在且
+        # 有 fail 级门禁时抛异常拒启动。本机测试环境没有现场标定/成像锁定, 而这里要测的是
+        # 「race_mode()==True 时颜色冲突仲裁怎么走」——门禁本身由 vision/test_vision_gates.py 覆盖,
+        # 所以只在本测试类里把门禁这一层 stub 掉; scan() 仍走真实 service/detector/相机。
+        patcher = unittest.mock.patch.object(VisionService, "_enforce_gates", lambda self: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         svc.start()
         self.addCleanup(svc.stop)
         self._det, self._Detection, self._tmp = det, Detection, tmp
@@ -1008,6 +1015,129 @@ class TestInfoAndQr(unittest.TestCase):
         ts = self._scan(svc)
         for t in ts:
             self.assertEqual(t.diagnostics.get("category_core"), "%s|%s|" % (t.shape, t.color))
+
+
+
+
+class TestMultiFrameMatch(unittest.TestCase):
+    """A5: 多帧融合匹配半径自适应 max(match_px_min, match_ratio × min(框宽, 框高))。
+
+    直接对 detect_multi() 注入 `_infer` (每帧一批 Detection) —— 融合/匹配逻辑本身是被测对象,
+    不碰真实模型与相机。
+    """
+
+    BOX = (100, 100, 180, 180)          # 80x80, 中心 (140,140)
+    BOX_60 = (160, 100, 240, 180)       # 同尺寸, 中心 (200,140): 中心距 60px
+    BOX_JIT = (115, 100, 195, 180)      # 同尺寸, 中心 (155,140): 抖动 15px
+    BIG = (100, 100, 400, 400)          # 300x300
+    BIG_60 = (160, 100, 460, 400)       # 同尺寸, 中心距 60px
+
+    class _StubEngine:
+        def __init__(self, names):
+            self.class_names = list(names)
+            self.is_ready = True
+            self.last_error = ""
+
+        def describe(self):
+            return "stub-match-engine"
+
+    def _det(self, match_ratio=None):
+        import json
+        import os
+        import shutil
+        import tempfile
+        from vision.calibration import CoordinateCalibrator
+        from vision.config import load_vision_config
+        from vision.interfaces import Detection
+        from vision.yolo_detector import YoloWorkpieceDetector
+
+        tmp = tempfile.mkdtemp(prefix="a5_match_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        names = ["红色半球", "蓝色半球"]
+        meta_path = os.path.join(tmp, "classes.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump({"color_names": {"red": "红色", "blue": "蓝色"},
+                       "hsv": {"hue_bins": [["red", 0, 10], ["red", 170, 179]]},
+                       "classes": [{"id": i, "name": n, "shape_cn": "hemisphere",
+                                    "color": None, "model_color": "red", "height_mm": 30}
+                                   for i, n in enumerate(names)]},
+                      f, ensure_ascii=False)
+        scn = {"min_hit_ratio": 0.5}
+        if match_ratio is not None:
+            scn["match_ratio"] = match_ratio
+        cfg_path = os.path.join(tmp, "vision_config.json")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump({"record": {"enabled": False}, "scan": scn,
+                       "camera": {"type": "replay", "path": tmp, "fps": 60}},
+                      f, ensure_ascii=False)
+        cfg = load_vision_config(cfg_path)
+        self._Detection = Detection
+        return YoloWorkpieceDetector(CoordinateCalibrator(),
+                                     engine=self._StubEngine(names),
+                                     meta_path=meta_path, config=cfg)
+
+    def _d(self, name, box, conf=0.9):
+        D = self._Detection
+        return D(0 if name == "红色半球" else 1, name, conf, *box)
+
+    def _run(self, det, per_frame, min_hit_ratio=0.5):
+        seq = [list(batch) for batch in per_frame]      # 每帧一批检测 (顺序消费)
+        det._infer = lambda frame: seq.pop(0) if seq else []
+        frames = [np.zeros((480, 640, 3), np.uint8) for _ in per_frame]
+        ts, _ref = det.detect_multi(frames, min_hit_ratio=min_hit_ratio)
+        return ts
+
+    # ------------------------------------------------------------ 半径公式
+    def test_match_radius_formula(self):
+        det = self._det()
+        self.assertAlmostEqual(det._match_radius(self._d("红色半球", self.BOX), 25.0), 28.0)
+        self.assertAlmostEqual(det._match_radius(self._d("红色半球", self.BIG), 25.0), 105.0)
+        self.assertAlmostEqual(det._match_radius(self._d("红色半球", (100, 100, 120, 120)), 25.0), 12.0)
+
+    def test_match_ratio_zero_falls_back_to_match_px(self):
+        """旧参数兜底: match_ratio<=0 时用调用方传的 match_px (service.scan() 仍在传它)。"""
+        det = self._det(match_ratio=0)
+        self.assertAlmostEqual(det._match_radius(self._d("红色半球", self.BIG), 25.0), 25.0)
+
+    # ------------------------------------------------------ 计划里的三条验收
+    def test_60px_apart_with_80px_box_stays_two(self):
+        """中心距 60px / 框 80px: 半径 28px < 60px -> 保持 2 个目标 (没有误并)。"""
+        det = self._det()
+        ts = self._run(det, [[self._d("红色半球", self.BOX),
+                              self._d("红色半球", self.BOX_60)]] * 5)
+        self.assertEqual(len(ts), 2)
+        self.assertEqual(sorted(t.hits for t in ts), [5, 5])
+
+    def test_15px_jitter_merges_to_one(self):
+        """抖动 15px: 半径 28px > 15px -> 合并成 1 个目标。"""
+        det = self._det()
+        ts = self._run(det, [[self._d("红色半球", self.BOX)],
+                             [self._d("红色半球", self.BOX)],
+                             [self._d("红色半球", self.BOX_JIT)],
+                             [self._d("红色半球", self.BOX_JIT)],
+                             [self._d("红色半球", self.BOX)]])
+        self.assertEqual(len(ts), 1)
+        self.assertEqual(ts[0].hits, 5)
+
+    def test_one_object_two_classes_takes_majority(self):
+        """一物两类: 5 帧里 2 帧 A / 3 帧 B -> 1 个目标且取多数 B (匹配与类别无关)。"""
+        det = self._det()
+        ts = self._run(det, [[self._d("红色半球", self.BOX)],
+                             [self._d("红色半球", self.BOX_JIT)],
+                             [self._d("蓝色半球", self.BOX)],
+                             [self._d("蓝色半球", self.BOX_JIT)],
+                             [self._d("蓝色半球", self.BOX)]])
+        self.assertEqual(len(ts), 1)
+        self.assertEqual(ts[0].class_name, "蓝色半球", "类别应按加权投票取多数")
+        self.assertEqual(ts[0].hits, 5)
+
+    def test_large_box_widens_radius_and_merges_60px(self):
+        """大件半径按比例放宽: 300px 框 -> 105px > 60px, 交替出现的两个框合成 1 个目标
+        (旧的固定 25px 会拆成 2 个)。"""
+        det = self._det()
+        ts = self._run(det, [[self._d("红色半球", self.BIG)], [self._d("红色半球", self.BIG_60)]] * 3)
+        self.assertEqual(len(ts), 1, "自适应半径应把 60px 内的同一件合并")
+        self.assertEqual(ts[0].hits, 6)
 
 
 

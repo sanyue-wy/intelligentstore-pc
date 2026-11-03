@@ -96,13 +96,14 @@ color_calib.py  现场 HSV 采样 -> 颜色区间        config.py  配置加载
 | `detect.parallax_factor` | 抓取高度 = 物体高度 × 该值（0.6 ≈ 上表面附近） |
 | `require_info` | **顶层**开关（默认 **false** = 旧行为）：true 时 `category` 第三段必须是解出的信息，解不出写 `unknown` 并压置信度触发抖料（A4，见 §7.2） |
 | `detect.qr_budget_ms` | 二维码解码时间预算（默认 500），按**整次 scan** 计；0 = 本次 scan 不解码（A4，见 §7.2） |
-| `scan.frames / min_hit_ratio / match_px` | 融合帧数 / 出现比例下限 / 匹配距离 |
+| `scan.frames / min_hit_ratio` | 融合帧数 / 出现比例下限（`min_hits = ceil(frames × min_hit_ratio)`，语义未变） |
+| `scan.match_ratio / match_px_min` | 多帧匹配半径 = `max(match_px_min, match_ratio × min(框宽, 框高))`（默认 0.35 / 12px，**按件大小自适应**，A5 见 §7.3）；`match_ratio <= 0` 时退回旧的固定 `match_px`（默认 25） |
 | `color.source` | `hsv`（默认：HSV 投票为权威，`classes.json` 的 `model_color` 只做冲突检测）/ `model`（应急：颜色直接用 `model_color`，**换颜色后就失效**，只用于板上 HSV 不可用时） |
 | `color.conflict_ttl_s / conflict_conf` | 冲突记忆 TTL（默认 60s）/ 比赛模式首次冲突把置信度压到的值（默认 0.43，须 < `COMMIT_CONF` 0.45，压下去才会触发一次抖料重扫） |
 | `color.tray_white_balance / wb_gain_min / wb_gain_max / wb_min_pixels` | 托盘白基准归一化（默认 **false**）；增益限幅 0.7~1.4；可用像素不足 200 时沿用上次增益。**只作用于颜色投票前的裁剪图，不改送模型的图**。`[现场待验证]` |
 | `record.enabled / dir / keep` | 每次 scan 存原图+标注图+json（`records/scans`），也是量化校准图来源 |
 
-环境变量临时覆盖：`IS_CAM_TYPE IS_CAM_DEVICE IS_CAM_SERIAL IS_CAM_REPLAY IS_CAM_W/H/FPS IS_CAM_EXPOSURE IS_CAM_GAIN IS_CAM_WB IS_YOLO_MODEL IS_YOLO_CONF IS_YOLO_IOU IS_PARALLAX_FACTOR IS_SCAN_FRAMES IS_VISION_RECORD IS_VISION_CONFIG IS_CAM_HEIGHT_MM IS_COLOR_SOURCE IS_TRAY_WB IS_COMPETITION_LOCK IS_REQUIRE_INFO IS_QR_BUDGET_MS IS_REQUIRE_INFO_CONF`。`IS_YOLO_CONF` 超出 0.05~0.95、`IS_YOLO_IOU` 超出 0.10~0.95 或不是数字时退回默认值，并写进自检问题（不会再静默检测全空）。颜色投票全落在 `hue_bins` 空隙时判 `unknown`，不再误判成 black。
+环境变量临时覆盖：`IS_CAM_TYPE IS_CAM_DEVICE IS_CAM_SERIAL IS_CAM_REPLAY IS_CAM_W/H/FPS IS_CAM_EXPOSURE IS_CAM_GAIN IS_CAM_WB IS_YOLO_MODEL IS_YOLO_CONF IS_YOLO_IOU IS_PARALLAX_FACTOR IS_SCAN_FRAMES IS_VISION_RECORD IS_VISION_CONFIG IS_CAM_HEIGHT_MM IS_COLOR_SOURCE IS_TRAY_WB IS_COMPETITION_LOCK IS_REQUIRE_INFO IS_QR_BUDGET_MS IS_REQUIRE_INFO_CONF IS_MATCH_RATIO IS_MATCH_PX_MIN`。`IS_YOLO_CONF` 超出 0.05~0.95、`IS_YOLO_IOU` 超出 0.10~0.95 或不是数字时退回默认值，并写进自检问题（不会再静默检测全空）。颜色投票全落在 `hue_bins` 空隙时判 `unknown`，不再误判成 black。
 
 ## 6. calib_config.json（`tray` 段）
 | 键 | 说明 |
@@ -155,6 +156,13 @@ DFOV 规格也能反算（`f = 对角像素/2 / tan(DFOV/2)`，100° 时 f@1920=
 - 时间预算 `detect.qr_budget_ms`（默认 500，`IS_QR_BUDGET_MS` 覆盖）按**整次 scan** 计（不是每件）：耗尽后本次 scan 内不再尝试解码，每件写 `diagnostics.qr_ms` 与 `qr_budget_exhausted`；设 0 = 本次 scan 完全不解码。
 - `diagnostics.category_core = "形状|颜色|"`（两段 + 尾随 `|`）**每个目标都有**（走 HSV 回退的也有），供复盘按形状+颜色聚合；`records/runs/<时间>/scan_NNN.json` 里 `category_core` 与 `category` 同时给出，`report.json` 结束时多一份 `category_core_counts`。
 - **`classes.json` 目前没有填任何 `info` 值**：现场是否有二维码、码里是什么内容都还没验证，不能编造。要用时按上面格式填 `info` 并标 `[现场待验证]`。
+
+### 7.3 多帧融合匹配半径（A5）
+- 旧的固定 `match_px=25` 对小件偏大、对大件偏小；现在半径 = `max(scan.match_px_min, scan.match_ratio × min(框宽, 框高))`（默认 12px / 0.35）。例：80px 框 → 28px，300px 框 → 105px。
+- 匹配**与类别无关**：同一件跨帧被认成不同类名也照合，类别按加权投票取多数（2 帧 A + 3 帧 B → 判 B）。
+- 「同类优先」只作**距离并列**时的 tie-breaker，不做硬过滤。
+- `min_hits` 语义不变（`ceil(帧数 × min_hit_ratio)`）；`service.scan()` 仍会传 `match_px`，只在 `scan.match_ratio <= 0` 时作为旧参数兜底生效。
+- `IS_MATCH_RATIO` / `IS_MATCH_PX_MIN` 可临时覆盖。
 
 ## 8. 换模型 / 换相机 / 复现
 - 换模型：`.pt` 放进 `vision/models/` → `./convert.sh`（`tools/GUIDE.md`）。

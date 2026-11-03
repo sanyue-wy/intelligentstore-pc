@@ -198,10 +198,29 @@ class YoloWorkpieceDetector(WorkpieceDetector):
         return [self._build_target(bgr_frame, d, i + 1, refine=False)
                 for i, d in enumerate(self._infer(bgr_frame))]
 
+    def _match_radius(self, det: Detection, match_px: float) -> float:
+        """多帧融合的匹配半径 (A5)。
+
+        半径 = ``max(scan.match_px_min, scan.match_ratio × min(框宽, 框高))`` —— 按目标自身
+        大小自适应: 小件用 match_px_min 兜底 (默认 12px), 大件按比例放宽, 不会被别的目标
+        尺寸带偏。``match_ratio <= 0`` 时退回旧的固定 ``match_px`` (``service.scan()`` 仍在传,
+        作为旧参数兜底)。
+        """
+        scn = getattr(self.cfg, "scan", None) or {}
+        ratio = float(scn.get("match_ratio", 0.35) or 0)
+        if ratio <= 0:
+            return float(match_px)
+        px_min = float(scn.get("match_px_min", 12) or 0)
+        return max(px_min, ratio * min(float(det.w), float(det.h)))
+
     def detect_multi(self, frames: Sequence[np.ndarray], min_hits: Optional[int] = None,
                      match_px: float = 25.0, min_hit_ratio: float = 0.5
                      ) -> Tuple[List[VisionTarget], Optional[np.ndarray]]:
-        """多帧融合。返回 (目标列表, 用于精定位/截图的那一帧)。"""
+        """多帧融合。返回 (目标列表, 用于精定位/截图的那一帧)。
+
+        匹配**与类别无关** (同一个框跨帧被认成不同类名也照合, 类别按加权投票取多数);
+        「同类优先」只在**距离并列**时做 tie-breaker, 不作硬过滤。``min_hits`` 语义不变。
+        """
         frames = [f for f in frames if f is not None and f.size]
         if not frames:
             return [], None
@@ -214,13 +233,21 @@ class YoloWorkpieceDetector(WorkpieceDetector):
         tracks: List[dict] = []
         for fi, f in enumerate(frames):
             for d in self._infer(f):
-                best, best_d = None, match_px
+                # A5: 半径按本目标大小自适应 (不再是固定 25px)
+                radius = self._match_radius(d, match_px)
+                cands = []
                 for t in tracks:
                     if t["last"] == fi:
                         continue
-                    dist = np.hypot(t["cx"][-1] - d.cx, t["cy"][-1] - d.cy)
-                    if dist < best_d:
-                        best, best_d = t, dist
+                    dist = float(np.hypot(t["cx"][-1] - d.cx, t["cy"][-1] - d.cy))
+                    if dist < radius:
+                        cands.append((dist, t))
+                best = None
+                if cands:
+                    dmin = min(c[0] for c in cands)
+                    near = [c for c in cands if c[0] <= dmin + 1e-6]   # 距离并列
+                    same = [c for c in near if d.cls_id in c[1]["votes"]]
+                    best = (same or near)[0][1]                        # 并列时同类优先 (tie-breaker)
                 if best is None:
                     best = {"cx": [], "cy": [], "dets": [], "votes": {}, "last": -1}
                     tracks.append(best)
