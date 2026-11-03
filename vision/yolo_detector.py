@@ -200,7 +200,9 @@ class YoloWorkpieceDetector(WorkpieceDetector):
         dets = self._infer(bgr_frame)
         # A6: 单帧路径也按当前帧 + 检测框重算一次白基准增益
         self._update_tray_wb(bgr_frame, [(d.x1, d.y1, d.x2, d.y2) for d in dets])
-        return [self._build_target(bgr_frame, d, i + 1, refine=self.refine)
+        # A4.1: 先按"配了 decode_qr 的类 + 置信度从高到低"规划扫码, 再按原顺序出目标
+        plan = self._qr_plan(bgr_frame, dets)
+        return [self._build_target(bgr_frame, d, i + 1, refine=self.refine, qr_override=plan[i])
                 for i, d in enumerate(dets)]
 
     def detect_fast(self, bgr_frame: np.ndarray) -> List[VisionTarget]:
@@ -276,7 +278,7 @@ class YoloWorkpieceDetector(WorkpieceDetector):
         ref = frames[ref_idx]
         # A6: 每次 scan 用参考帧 + 该帧检测框重算一次白基准增益 (增益按整次 scan 用)
         self._update_tray_wb(ref, boxes_by_frame.get(ref_idx, []))
-        targets: List[VisionTarget] = []
+        finals: List[Tuple[Detection, int]] = []
         for t in tracks:
             hits = len(t["dets"])
             if hits < min_hits:
@@ -286,8 +288,12 @@ class YoloWorkpieceDetector(WorkpieceDetector):
             conf = float(np.mean([d.conf for d in same])) * min(1.0, hits / n + 0.2)
             # 用中位框做精定位 (抗单帧抖动)
             box = np.median(np.array([[d.x1, d.y1, d.x2, d.y2] for d in same]), axis=0)
-            d = Detection(cls_id, same[0].name, conf, *box.tolist())
-            tgt = self._build_target(ref, d, len(targets) + 1, refine=True)
+            finals.append((Detection(cls_id, same[0].name, conf, *box.tolist()), hits))
+        # A4.1: 定稿后按置信度从高到低规划扫码 (预算整次 scan 共享、命中即停), 结果按原顺序写回
+        plan = self._qr_plan(ref, [d for d, _ in finals])
+        targets: List[VisionTarget] = []
+        for i, (d, hits) in enumerate(finals):
+            tgt = self._build_target(ref, d, i + 1, refine=True, qr_override=plan[i])
             tgt.hits = hits
             targets.append(tgt)
         return targets, ref
@@ -297,10 +303,48 @@ class YoloWorkpieceDetector(WorkpieceDetector):
         ts = super().detect(frame)
         for t in ts:
             t.label = self.color_cn.get(t.color, t.color) + "货物"
-            t.category = f"{t.shape}|{t.color}|"
-            # A4: category_core (形状|颜色|) 每个目标都要有, 与 YOLO 路径一致
-            t.diagnostics.update({"category_core": f"{t.shape}|{t.color}|"})
+            # A4.1: require_info=true 而模型不可用时, 既没有声明也没有解码 -> 信息只能是 unknown,
+            #        category 仍三段, 置信度压到 require_info_conf 以下触发抖料 (否则模型挂掉时
+            #        require_info 形同虚设)。require_info=false 时与旧行为逐步一致。
+            if getattr(self, "require_info", False):
+                cap = float(getattr(self, "require_info_conf", 0.43) or 0.43)
+                t.info = "unknown"
+                t.category = f"{t.shape}|{t.color}|unknown"
+                t.confidence = round(min(float(t.confidence), cap), 3)
+                t.diagnostics.update({"category_core": f"{t.shape}|{t.color}|",
+                                      "info_missing": True})
+            else:
+                t.category = f"{t.shape}|{t.color}|"
+                # A4: category_core (形状|颜色|) 每个目标都要有, 与 YOLO 路径一致
+                t.diagnostics.update({"category_core": f"{t.shape}|{t.color}|"})
         return ts
+
+    def _qr_plan(self, frame: np.ndarray,
+                 dets: Sequence[Detection]) -> List[Optional[dict]]:
+        """A4.1 扫码优先级: 只有 classes.json 里配了 ``decode_qr`` 的类才参与解码。
+
+        按**置信度从高到低**依次解码, 预算整次 scan 共享、命中即停 —— 避免推理顺序里
+        排在前面但置信度低的目标先把预算吃掉、让高置信度目标 ``attempted=False``。
+        返回与 ``dets`` 等长的列表: 不参与解码的位置是 ``None``; 参与的位置即使因为预算
+        耗尽没真解, 也给显式结果 (attempted=False / exhausted=True), 让 diagnostics 如实上报。
+        """
+        out: List[Optional[dict]] = [None] * len(dets)
+        if not self.decode_qr_enabled or not dets:
+            return out
+        cands: List[Tuple[int, Detection]] = []
+        for i, d in enumerate(dets):
+            _decl, want_qr, _tpl = self._parse_info(self.class_meta.get(d.name, {}))
+            if want_qr:
+                cands.append((i, d))
+        cands.sort(key=lambda it: (-float(it[1].conf), it[0]))
+        for i, d in cands:
+            if getattr(self, "_qr_exhausted", True):
+                out[i] = {"text": "", "ms": 0.0, "decoder": "none",
+                          "attempted": False, "exhausted": True}
+                continue
+            out[i] = self._decode_qr(frame, int(d.x1), int(d.y1),
+                                     int(np.ceil(d.x2)), int(np.ceil(d.y2)))
+        return out
 
     # ================================================================== 单目标
     def _parse_info(self, meta: dict) -> Tuple[str, bool, Optional[str]]:
@@ -330,7 +374,8 @@ class YoloWorkpieceDetector(WorkpieceDetector):
         self._qr_used_ms = 0.0
         self._qr_exhausted = self.qr_budget_ms <= 0
 
-    def _build_target(self, frame: np.ndarray, d: Detection, idx: int, refine: bool) -> VisionTarget:
+    def _build_target(self, frame: np.ndarray, d: Detection, idx: int, refine: bool,
+                      qr_override: Optional[dict] = None) -> VisionTarget:
         meta = self.class_meta.get(d.name, {})
         h_img, w_img = frame.shape[:2]
         x1, y1, x2, y2 = int(d.x1), int(d.y1), int(np.ceil(d.x2)), int(np.ceil(d.y2))
@@ -357,7 +402,9 @@ class YoloWorkpieceDetector(WorkpieceDetector):
         qr = {"text": "", "ms": 0.0, "decoder": "none", "attempted": False,
               "exhausted": bool(self._qr_exhausted)}
         if refine and self.decode_qr_enabled and want_qr:
-            qr = self._decode_qr(frame, x1, y1, x2, y2)
+            # A4.1: detect()/detect_multi() 会先做扫码优先级规划再传结果 (qr_override);
+            #        直接单目标调用 (预览/测试) 没传时沿用即时解码。
+            qr = self._decode_qr(frame, x1, y1, x2, y2) if qr_override is None else qr_override
             if qr["text"]:
                 info = f"{info}:{qr['text']}" if info else qr["text"]
         if self.require_info and not info:

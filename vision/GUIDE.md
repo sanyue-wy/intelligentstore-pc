@@ -159,6 +159,9 @@ DFOV 规格也能反算（`f = 对角像素/2 / tan(DFOV/2)`，100° 时 f@1920=
 - `diagnostics.category_core = "形状|颜色|"`（两段 + 尾随 `|`）**每个目标都有**（走 HSV 回退的也有），供复盘按形状+颜色聚合；`records/runs/<时间>/scan_NNN.json` 里 `category_core` 与 `category` 同时给出，`report.json` 结束时多一份 `category_core_counts`。
 - **`classes.json` 目前没有填任何 `info` 值**：现场是否有二维码、码里是什么内容都还没验证，不能编造。要用时按上面格式填 `info` 并标 `[现场待验证]`。
 
+- 解码顺序（A4.1）：一次 scan 里只对"配了 `decode_qr` 的类"解码，并且按**该类目标的置信度从高到低**排序，预算仍是整次 scan 共享、命中即停；没配 `decode_qr` 的类完全不参与解码、也不吃预算。这样低置信度的目标不会抢在高置信度目标之前把预算耗光。
+- HSV 兜底（A4.1）：引擎不可用走 `_hsv_fallback` 时，若 `require_info=true`，info 记为 `unknown`、category 仍是三段、置信度压到 `detect.require_info_conf`（0.43）以下触发抖料；`require_info=false` 时兜底输出与旧版逐字段相同。
+
 ### 7.3 多帧融合匹配半径（A5）
 - 旧的固定 `match_px=25` 对小件偏大、对大件偏小；现在半径 = `max(scan.match_px_min, scan.match_ratio × min(框宽, 框高))`（默认 12px / 0.35）。例：80px 框 → 28px，300px 框 → 105px。
 - 匹配**与类别无关**：同一件跨帧被认成不同类名也照合，类别按加权投票取多数（2 帧 A + 3 帧 B → 判 B）。

@@ -1019,6 +1019,104 @@ class TestInfoAndQr(unittest.TestCase):
 
 
 
+    # ---------------------------------------------------------------- A4.1 扫码优先级
+    def _detecting_mixed(self, a_name, a_conf, b_name, b_conf):
+        """一次 scan 里注入两个不同类的目标 (A4.1 排序用)。"""
+        D = self._Detection
+        self._det._infer = lambda frame: [D(0, a_name, a_conf, *self.BOX),
+                                          D(1, b_name, b_conf, *self.BOX2)]
+
+    def test_qr_priority_decodes_higher_confidence_first(self):
+        """反例回归: 低置信度在前、预算只够一件时, 预算必须给高置信度的那个。"""
+        svc = self._setup(qr_budget_ms=15, classes_extra={
+            "红色半球": {"info": {"text": "A", "decode_qr": True}},
+            "蓝色半球": {"info": {"text": "B", "decode_qr": True}}})
+        fake = self._FakeQR("QR-123", delay_s=0.05)
+        self._det._qr = ("aruco", fake)
+        # 推理顺序: 红色(0.30) 在前, 蓝色(0.95) 在后
+        self._detecting_mixed("红色半球", 0.30, "蓝色半球", 0.95)
+        ts = self._scan(svc)
+        by = {t.class_name: t for t in ts}
+        self.assertEqual(sorted(by), ["红色半球", "蓝色半球"])
+        low, high = by["红色半球"], by["蓝色半球"]
+        self.assertTrue(high.diagnostics["qr_attempted"], "高置信度目标应该先拿到预算")
+        self.assertEqual(high.info, "B:QR-123")
+        self.assertFalse(low.diagnostics["qr_attempted"], "预算耗尽后低置信度目标不该再解码")
+        self.assertTrue(low.diagnostics["qr_budget_exhausted"])
+        self.assertEqual(low.info, "A")
+        self.assertEqual(fake.calls, 1)
+
+    def test_qr_priority_keeps_detection_order(self):
+        """detect_multi() 的返回顺序仍是推理/融合顺序 (service.scan() 的按置信度排序是既有行为)。"""
+        import os
+
+        import cv2
+
+        self._setup(classes_extra={
+            "红色半球": {"info": {"text": "A", "decode_qr": True}},
+            "蓝色半球": {"info": {"text": "B", "decode_qr": True}}})
+        self._det._qr = ("aruco", self._FakeQR("QR-123"))
+        self._detecting_mixed("红色半球", 0.30, "蓝色半球", 0.95)
+        frame = cv2.imread(os.path.join(self._tmp, "frame.png"))
+        self.assertIsNotNone(frame)
+        raw, _ref = self._det.detect_multi([frame, frame], min_hit_ratio=0.5)
+        self.assertEqual([t.class_name for t in raw], ["红色半球", "蓝色半球"])
+        self.assertEqual([t.target_id for t in raw], [1, 2])
+
+    def test_qr_priority_skips_classes_without_config(self):
+        """没配 decode_qr 的类不参与解码, 也**不吃预算** (哪怕它置信度最高)。"""
+        svc = self._setup(classes_extra={
+            "红色半球": {"info": {"text": "N1"}},                      # 无 decode_qr
+            "蓝色半球": {"info": {"text": "N2", "decode_qr": True}}})
+        fake = self._FakeQR("QR-123")
+        self._det._qr = ("aruco", fake)
+        self._detecting_mixed("红色半球", 0.99, "蓝色半球", 0.50)
+        ts = self._scan(svc)
+        high, low = ts[0], ts[1]          # 红色 conf 高但不参与
+        self.assertFalse(high.diagnostics["qr_attempted"])
+        self.assertEqual(high.info, "N1")
+        self.assertTrue(low.diagnostics["qr_attempted"])
+        self.assertEqual(low.info, "N2:QR-123")
+        self.assertEqual(fake.calls, 1, "没配 decode_qr 的类不该调解码器")
+
+    # ---------------------------------------------------------------- A4.1 HSV 兜底 + require_info
+    def test_hsv_fallback_require_info_unknown(self):
+        """引擎挂掉时 require_info 不能形同虚设: info=unknown + category 三段 + 压置信度。"""
+        svc = self._setup(require_info=True)
+        self._det.engine.is_ready = False
+        ts = self._scan(svc)
+        for t in ts:
+            core = "%s|%s|" % (t.shape, t.color)
+            self.assertEqual(t.info, "unknown")
+            self.assertEqual(t.category, core + "unknown")
+            self.assertEqual(t.category.count("|"), 2)
+            self.assertLess(t.confidence, 0.45, "信息解不出必须压到 COMMIT_CONF 以下触发抖料")
+            self.assertTrue(t.diagnostics.get("info_missing"))
+            self.assertEqual(t.diagnostics.get("category_core"), core)
+
+    def test_hsv_fallback_without_require_info_is_unchanged(self):
+        """require_info=false 时 HSV 兜底与 A4 行为逐字段一致 (回归)。"""
+        import os
+
+        import cv2
+        from vision.detector import WorkpieceDetector
+
+        svc = self._setup(require_info=False)
+        self._det.engine.is_ready = False
+        frame = cv2.imread(os.path.join(self._tmp, "frame.png"))
+        self.assertIsNotNone(frame)
+        base = WorkpieceDetector.detect(self._det, frame)      # 基类原样检测 = 旧行为的参照
+        ts = self._det.detect(frame)                            # 引擎不可用 -> _hsv_fallback
+        self.assertTrue(ts)
+        self.assertEqual([(t.color, t.shape, t.confidence, t.u_pixel, t.v_pixel) for t in ts],
+                         [(t.color, t.shape, t.confidence, t.u_pixel, t.v_pixel) for t in base])
+        for t in ts:
+            self.assertEqual(t.info, "", "require_info=false 时 info 必须还是空串")
+            self.assertEqual(t.category, "%s|%s|" % (t.shape, t.color))
+            self.assertEqual(t.label, "%s货物" % ("红色" if t.color == "red" else t.color))
+            self.assertNotIn("info_missing", t.diagnostics)
+            self.assertEqual(t.diagnostics.get("category_core"), "%s|%s|" % (t.shape, t.color))
+
 class TestMultiFrameMatch(unittest.TestCase):
     """A5: 多帧融合匹配半径自适应 max(match_px_min, match_ratio × min(框宽, 框高))。
 
