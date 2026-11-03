@@ -1580,5 +1580,140 @@ class TestConflictReport(unittest.TestCase):
         self.assertEqual(cfg.warnings, [])
 
 
+class TestProjectionHeight(unittest.TestCase):
+    """A8: pixel_to_robot(u,v,h) 的 h = 投影平面高度 (proj_h_mm > thin 系数 > parallax_factor)。"""
+
+    NAMES = ["红色半球"]
+    BOX = (100, 100, 200, 200)          # refine=False -> u,v = 框中心 (150, 150)
+
+    class _StubEngine:
+        def __init__(self, names):
+            self.class_names = list(names)
+            self.is_ready = True
+            self.last_error = ""
+
+        def describe(self):
+            return "stub-proj-engine"
+
+    def _det(self, classes, detect=None, env=None):
+        import json
+        import os
+        import shutil
+        import tempfile
+        from vision.calibration import CoordinateCalibrator
+        from vision.config import load_vision_config
+        from vision.interfaces import Detection
+        from vision.yolo_detector import YoloWorkpieceDetector
+
+        tmp = tempfile.mkdtemp(prefix="a8_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        meta = os.path.join(tmp, "classes.json")
+        with open(meta, "w", encoding="utf-8") as f:
+            json.dump({"classes": classes, "color_names": {"red": "红色"},
+                       "hsv": {"black_v_max": 60, "white_s_max": 45, "white_v_min": 150,
+                               "hue_bins": [["red", 0, 10], ["red", 170, 179]]}},
+                      f, ensure_ascii=False)
+        cfg_path = os.path.join(tmp, "vision_config.json")
+        cfg_d = {"backend": "yolo", "record": {"enabled": False},
+                 "detect": dict({"refine": False, "decode_qr": False,
+                                 "parallax_factor": 0.6, "parallax_factor_thin": None},
+                                **(detect or {}))}
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg_d, f, ensure_ascii=False)
+        old = {}
+        for k, v in (env or {}).items():
+            old[k] = os.environ.get(k)
+            os.environ[k] = v
+
+        def _restore():
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+        self.addCleanup(_restore)
+        cfg = load_vision_config(cfg_path)
+        calib = os.path.join(tmp, "calib.json")
+        with open(calib, "w", encoding="utf-8") as f:
+            # cam_height_mm > 0 才会走"按高度反算"的视差模型 (否则 XY 与 h 无关, 测不出 A8)
+            json.dump({"tray": {"enabled": False}, "image_size": [640, 480],
+                       "cam_height_mm": 128.5}, f)
+        det = YoloWorkpieceDetector(CoordinateCalibrator(config_path=calib),
+                                    engine=self._StubEngine(self.NAMES),
+                                    meta_path=meta, config=cfg)
+        det._infer = lambda frame: [Detection(0, self.NAMES[0], 0.9, *self.BOX)]
+        return det
+
+    def _one(self, det):
+        import numpy as np
+        frame = np.full((480, 640, 3), 60, np.uint8)
+        ts = det.detect(frame)
+        self.assertEqual(len(ts), 1)
+        return ts[0]
+
+    def _cls(self, **kw):
+        base = {"id": 0, "name": "红色半球", "shape_cn": "hemisphere", "height_mm": 30}
+        base.update(kw)
+        return base
+
+    def test_proj_h_mm_wins_over_height_times_factor(self):
+        """填了 proj_h_mm 就直接用它, 不再乘系数 (XY 与 height_mm×factor 不同)。"""
+        a = self._one(self._det([self._cls()]))
+        self.assertEqual(a.diagnostics["proj_h_mm"], 18.0)
+        self.assertEqual(a.diagnostics["parallax_factor"], 0.6)
+        det_b = self._det([self._cls(proj_h_mm=100)])
+        b = self._one(det_b)
+        self.assertEqual(b.diagnostics["proj_h_mm"], 100.0)
+        self.assertIsNone(b.diagnostics["parallax_factor"], "填了 proj_h_mm 就不再乘系数")
+        self.assertNotEqual((a.x_mm, a.y_mm), (b.x_mm, b.y_mm))
+        self.assertEqual((b.x_mm, b.y_mm), det_b.calibrator.pixel_to_robot(150.0, 150.0, 100.0),
+                         "h 必须正好是 proj_h_mm")
+
+    def test_thin_factor_only_for_thin_wall(self):
+        """thin_wall 类用 parallax_factor_thin, 其它类仍用 parallax_factor。"""
+        thin = self._one(self._det([self._cls(thin_wall=True)],
+                                   detect={"parallax_factor_thin": 1.2}))
+        self.assertEqual(thin.diagnostics["proj_h_mm"], 36.0)
+        self.assertEqual(thin.diagnostics["parallax_factor"], 1.2)
+        solid = self._one(self._det([self._cls()],
+                                    detect={"parallax_factor_thin": 1.2}))
+        self.assertEqual(solid.diagnostics["proj_h_mm"], 18.0)
+        self.assertEqual(solid.diagnostics["parallax_factor"], 0.6)
+        default_thin = self._one(self._det([self._cls(thin_wall=True)]))
+        self.assertEqual(default_thin.diagnostics["proj_h_mm"], 18.0,
+                         "parallax_factor_thin 默认 null = 同 parallax_factor")
+        self.assertNotEqual((thin.x_mm, thin.y_mm), (solid.x_mm, solid.y_mm),
+                            "两系数不同 -> 投影高度不同 -> 反算 XY 不同")
+
+    def test_proj_h_mm_beats_thin_factor(self):
+        det = self._det([self._cls(thin_wall=True, proj_h_mm=7)],
+                        detect={"parallax_factor_thin": 1.2})
+        t = self._one(det)
+        self.assertEqual(t.diagnostics["proj_h_mm"], 7.0)
+        self.assertIsNone(t.diagnostics["parallax_factor"])
+        self.assertEqual((t.x_mm, t.y_mm), det.calibrator.pixel_to_robot(150.0, 150.0, 7.0))
+
+    def test_thin_factor_env_override(self):
+        t = self._one(self._det([self._cls(thin_wall=True)],
+                                env={"IS_PARALLAX_FACTOR_THIN": "0.9"}))
+        self.assertEqual(t.diagnostics["proj_h_mm"], 27.0)
+        self.assertEqual(t.diagnostics["parallax_factor"], 0.9)
+
+    def test_env_thin_factor_ignored_for_solid_class(self):
+        t = self._one(self._det([self._cls()], env={"IS_PARALLAX_FACTOR_THIN": "0.9"}))
+        self.assertEqual(t.diagnostics["proj_h_mm"], 18.0)
+        self.assertEqual(t.diagnostics["parallax_factor"], 0.6)
+
+    def test_xy_changes_with_projection_height(self):
+        """投影平面高度确实参与反算: 18 / 36 / 100 三个高度给出三组不同 XY。"""
+        pts = []
+        for kw, detect in (({}, None), ({"thin_wall": True}, {"parallax_factor_thin": 1.2}),
+                           ({"proj_h_mm": 100}, None)):
+            t = self._one(self._det([self._cls(**kw)], detect=detect))
+            pts.append((t.x_mm, t.y_mm))
+        self.assertEqual(len(set(pts)), 3, pts)
+
+
 if __name__ == "__main__":
     unittest.main()

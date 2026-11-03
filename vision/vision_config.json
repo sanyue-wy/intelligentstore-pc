@@ -11,7 +11,8 @@
     "color 段见下 (A1 颜色来源/冲突仲裁, A6 托盘白基准)。",
     "require_info: true 时 category 第三段必须是可解出的信息 (classes.json 的 info / 二维码), 解不出写 \"unknown\" 并把置信度压到 detect.require_info_conf 触发抖料重扫; 默认 false = 旧行为。",
     "detect.qr_budget_ms: 二维码解码时间预算, 按整次 scan 计 (不是每件); 0 = 本次 scan 不解码。解码器/耗时/是否耗尽写在每个目标的 diagnostics 里。",
-    "scan.match_ratio / match_px_min (A5): 多帧融合的匹配半径 = max(match_px_min, match_ratio × min(框宽, 框高)); 半径按目标大小自适应, 小件不会被大件的匹配半径吃掉。match_ratio <= 0 时退回旧的固定 match_px。"
+    "scan.match_ratio / match_px_min (A5): 多帧融合的匹配半径 = max(match_px_min, match_ratio × min(框宽, 框高)); 半径按目标大小自适应, 小件不会被大件的匹配半径吃掉。match_ratio <= 0 时退回旧的固定 match_px。",
+    "parallax_factor_thin: 薄壁件(classes.json thin_wall=true)专用视差系数; null=用 parallax_factor; classes.json 的 proj_h_mm 优先级最高(A8)"
   ],
   "backend": "yolo",
   "require_info": false,
@@ -44,6 +45,7 @@
     "qr_budget_ms": 500,
     "require_info_conf": 0.43,
     "parallax_factor": 0.6,
+    "parallax_factor_thin": null,
     "min_area_px": 250,
     "max_area_px": 0,
     "roi": [],

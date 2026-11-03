@@ -15,6 +15,7 @@
     IS_CAM_EXPOSURE      曝光 (微秒)      IS_CAM_GAIN  增益 (dB)     IS_CAM_WB  白平衡色温 (K)
     IS_YOLO_MODEL / IS_YOLO_BACKEND / IS_YOLO_CONF / IS_YOLO_IOU
     IS_PARALLAX_FACTOR   抓取点取物体高度的比例
+    IS_PARALLAX_FACTOR_THIN 薄壁件 (classes.json thin_wall=true) 专用比例 (A8; 默认同上)
     IS_SCAN_FRAMES       scan() 默认融合帧数
     IS_VISION_RECORD     1/0  是否保存每次 scan 的原图+标注图
     IS_VISION_RECORD_DIR 保存目录
@@ -63,6 +64,8 @@ DEFAULTS: Dict[str, Any] = {
     },
     "detect": {
         "refine": True, "decode_qr": True, "parallax_factor": 0.6,
+        # A8: 薄壁件 (classes.json thin_wall=true) 专用视差系数; null = 同 parallax_factor。
+        "parallax_factor_thin": None,
         "min_area_px": 250, "max_area_px": 0, "roi": [], "edge_margin_px": 0,
         # A4 QR 时间预算: 按「整次 scan」计 (不是每件); 0 = 本次 scan 完全不解码
         "qr_budget_ms": 500,
@@ -186,6 +189,8 @@ def load_vision_config(path: Optional[str] = None) -> VisionConfig:
             mdl[name] = float(env[key])
     if env.get("IS_PARALLAX_FACTOR"):
         det["parallax_factor"] = float(env["IS_PARALLAX_FACTOR"])
+    if env.get("IS_PARALLAX_FACTOR_THIN"):
+        det["parallax_factor_thin"] = float(env["IS_PARALLAX_FACTOR_THIN"])
     if env.get("IS_SCAN_FRAMES"):
         scn["frames"] = int(env["IS_SCAN_FRAMES"])
     if env.get("IS_VISION_RECORD"):

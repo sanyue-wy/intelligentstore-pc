@@ -93,7 +93,9 @@ color_calib.py  现场 HSV 采样 -> 颜色区间        config.py  配置加载
 | `model.conf / iou / class_conf` | 全局 / 按类置信度阈值 |
 | `detect.roi` | 手动 ROI；托盘模式下留空即自动 |
 | `detect.min_area_px / max_area_px / edge_margin_px` | 过滤误检、贴边截断目标 |
-| `detect.parallax_factor` | 抓取高度 = 物体高度 × 该值（0.6 ≈ 上表面附近） |
+| `detect.parallax_factor` | 抓取高度 = 物体高度 × 该值（0.6 ≈ 上表面附近，经验值 `[现场待验证]`） |
+| `detect.parallax_factor_thin` | 薄壁件（`classes.json` `thin_wall: true`）专用系数；null = 同上 |
+| `classes.json` 逐类 `proj_h_mm` | 直接指定投影平面高度 (mm)，优先级最高；填了就完全不乘系数 |
 | `require_info` | **顶层**开关（默认 **false** = 旧行为）：true 时 `category` 第三段必须是解出的信息，解不出写 `unknown` 并压置信度触发抖料（A4，见 §7.2） |
 | `detect.qr_budget_ms` | 二维码解码时间预算（默认 500），按**整次 scan** 计；0 = 本次 scan 不解码（A4，见 §7.2） |
 | `scan.frames / min_hit_ratio` | 融合帧数 / 出现比例下限（`min_hits = ceil(frames × min_hit_ratio)`，语义未变） |
@@ -103,7 +105,7 @@ color_calib.py  现场 HSV 采样 -> 颜色区间        config.py  配置加载
 | `color.tray_white_balance / wb_gain_min / wb_gain_max / wb_min_pixels` | 托盘白基准归一化（默认 **false**）；增益限幅 0.7~1.4；可用像素不足 200 时沿用上次增益。**只作用于颜色投票前的裁剪图，不改送模型的图**。`[现场待验证]` |
 | `record.enabled / dir / keep` | 每次 scan 存原图+标注图+json（`records/scans`），也是量化校准图来源 |
 
-环境变量临时覆盖：`IS_CAM_TYPE IS_CAM_DEVICE IS_CAM_SERIAL IS_CAM_REPLAY IS_CAM_W/H/FPS IS_CAM_EXPOSURE IS_CAM_GAIN IS_CAM_WB IS_YOLO_MODEL IS_YOLO_CONF IS_YOLO_IOU IS_PARALLAX_FACTOR IS_SCAN_FRAMES IS_VISION_RECORD IS_VISION_CONFIG IS_CAM_HEIGHT_MM IS_COLOR_SOURCE IS_CONFLICT_TTL_S IS_CONFLICT_CONF IS_TRAY_WB IS_TRAY_WB_GAIN_MIN IS_TRAY_WB_GAIN_MAX IS_TRAY_WB_MIN_PIXELS IS_COMPETITION_LOCK IS_REQUIRE_INFO IS_QR_BUDGET_MS IS_REQUIRE_INFO_CONF IS_MATCH_RATIO IS_MATCH_PX_MIN`。`IS_YOLO_CONF` 超出 0.05~0.95、`IS_YOLO_IOU` 超出 0.10~0.95 或不是数字时退回默认值，并写进自检问题（不会再静默检测全空）。颜色投票全落在 `hue_bins` 空隙时判 `unknown`，不再误判成 black。
+环境变量临时覆盖：`IS_CAM_TYPE IS_CAM_DEVICE IS_CAM_SERIAL IS_CAM_REPLAY IS_CAM_W/H/FPS IS_CAM_EXPOSURE IS_CAM_GAIN IS_CAM_WB IS_YOLO_MODEL IS_YOLO_CONF IS_YOLO_IOU IS_PARALLAX_FACTOR IS_PARALLAX_FACTOR_THIN IS_SCAN_FRAMES IS_VISION_RECORD IS_VISION_CONFIG IS_CAM_HEIGHT_MM IS_COLOR_SOURCE IS_CONFLICT_TTL_S IS_CONFLICT_CONF IS_TRAY_WB IS_TRAY_WB_GAIN_MIN IS_TRAY_WB_GAIN_MAX IS_TRAY_WB_MIN_PIXELS IS_COMPETITION_LOCK IS_REQUIRE_INFO IS_QR_BUDGET_MS IS_REQUIRE_INFO_CONF IS_MATCH_RATIO IS_MATCH_PX_MIN`。`IS_YOLO_CONF` 超出 0.05~0.95、`IS_YOLO_IOU` 超出 0.10~0.95 或不是数字时退回默认值，并写进自检问题（不会再静默检测全空）。颜色投票全落在 `hue_bins` 空隙时判 `unknown`，不再误判成 black。
 
 ## 6. calib_config.json（`tray` 段）
 | 键 | 说明 |
@@ -193,3 +195,17 @@ DFOV 规格也能反算（`f = 对角像素/2 / tan(DFOV/2)`，100° 时 f@1920=
 | 整体平移几毫米 | 参考点的机械臂坐标或托盘坐标量错；用点击方式重加 |
 | 蓝/浅蓝、黄/橙混淆 | 锁白平衡；颜色页重新采样 |
 | BPU 不可用 | `sudo deploy/bpu_doctor.sh`，必要时 `./is.sh migrate` |
+
+### 7.5 抓取高度语义（A8）
+
+`_build_target()` 传给 `cal.pixel_to_robot(u, v, h)` 的 **h 是"投影平面高度"** —— 该物件被抓取时要对齐的那个水平面相对托盘/相机基准的高度 (mm)，**不是下潜深度、也不是夹持高度**。相机是斜看的，同一个像素落在不同高度上对应托盘里不同的 (x_mm, y_mm)，所以这个值直接决定抓取点。
+
+取值优先级（从高到低）：
+
+1. `classes.json` 里该类填了 `proj_h_mm` → **直接用它**（现场逐类实测最准，比赛前推荐补上）；
+2. 该类是薄壁件（`thin_wall: true`）且配了 `detect.parallax_factor_thin` → `height_mm × parallax_factor_thin`；
+3. 否则 `height_mm × detect.parallax_factor`。
+
+`parallax_factor` 默认 **0.6** 只是经验值（约等于"上表面的高度带"），**`[现场待验证]`**：量产前请用「点哪去哪」在真实相机高度/倾角下对着实物顶面标定，或逐类填 `proj_h_mm` 覆盖。`parallax_factor_thin` 默认 `null`（= 同 `parallax_factor`）；薄壁件的几何质心在空腔里，"填洞后质心 ≈ 实体件"，所以这两个系数通常**差别不大**，别指望用它救回大偏差 —— 要准就填 `proj_h_mm`。
+
+每次检测把实际用的值写进 `diagnostics`：`proj_h_mm`（真正传给 `pixel_to_robot` 的高度）与 `parallax_factor`（用了哪个系数，`proj_h_mm` 生效时为 null）。现场若发现抓偏，先核对这两个值。`IS_PARALLAX_FACTOR` / `IS_PARALLAX_FACTOR_THIN` 可临时覆盖系数。

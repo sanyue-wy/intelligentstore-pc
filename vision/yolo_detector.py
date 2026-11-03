@@ -103,6 +103,9 @@ class YoloWorkpieceDetector(WorkpieceDetector):
         self._wb_info: dict = {"reason": "disabled" if not self.wb_enabled else "not_run",
                                "pixels": 0, "gain": None, "means": None}
         self.parallax_factor = float(det_cfg.get("parallax_factor", 0.6))
+        # A8: 薄壁件 (classes.json thin_wall) 专用视差系数; 默认 null = 同 parallax_factor
+        _thin = det_cfg.get("parallax_factor_thin", None)
+        self.parallax_factor_thin = None if _thin in (None, "") else float(_thin)
         self.min_area_px = float(det_cfg.get("min_area_px", 0) or 0)
         self.max_area_px = float(det_cfg.get("max_area_px", 0) or 0)
         self.edge_margin_px = float(det_cfg.get("edge_margin_px", 0) or 0)
@@ -414,12 +417,26 @@ class YoloWorkpieceDetector(WorkpieceDetector):
         # 中文类名」当形状 (现场: 新类别 蓝色半球|red|), category 第一段随模型颜色变化。
         shape = meta.get("shape_cn") or meta.get("shape") or d.name
         height = float(meta.get("height_mm", 0) or 0)
+        # A8: pixel_to_robot(u, v, h) 里的 h 是**投影平面高度**, 即该物件被抓取时要对齐的
+        #     那个水平面相对托盘/相机基准的高度 —— 不是下潜深度, 也不是夹持高度:
+        #       - classes.json 填了 proj_h_mm 就直接用它 (现场逐类实测最准);
+        #       - 否则 height_mm × 视差系数 (0.6 是经验值, 约等于"上表面的高度带", [现场待验证]);
+        #       - 薄壁件 (thin_wall) 若配了 parallax_factor_thin 就用它 (薄壁件几何中心在空腔里,
+        #         填洞后质心≈实体件, 所以两个系数通常差别不大, 别指望它救回大偏差)。
+        proj_h_raw = meta.get("proj_h_mm", None)
+        factor = None
+        if proj_h_raw is None:
+            factor = getattr(self, "parallax_factor_thin", None)
+            if not thin or factor is None:
+                factor = getattr(self, "parallax_factor", 0.6)
+            proj_h = height * float(factor)
+        else:
+            proj_h = float(proj_h_raw or 0)
         cal = self.calibrator
-        # 抓取点高度 = 物体高度 × IS_PARALLAX_FACTOR (0.6 约等于上表面的高度带);
         # 未标定画面尺寸 (principal_px 缺省) 时按当前帧中心兜底, 只影响视差项。
         if cal.cam_height_mm > 0 and cal.principal_px is None and cal.camera_matrix is None:
             cal.principal_px = (w_img / 2.0, h_img / 2.0)
-        x_mm, y_mm = cal.pixel_to_robot(u, v, height * self.parallax_factor)
+        x_mm, y_mm = cal.pixel_to_robot(u, v, float(proj_h))
 
         label = meta.get("name") or (self.color_cn.get(color, color) + meta.get("shape_cn", shape))
         if info and not meta.get("name"):
@@ -442,6 +459,8 @@ class YoloWorkpieceDetector(WorkpieceDetector):
             "model_color": model_color, "hsv_color": hsv_color,
             "color_source": self.color_source,
             "category_core": f"{shape}|{color}|",
+            "proj_h_mm": round(float(proj_h), 3),           # A8: 实际用于 pixel_to_robot 的投影平面高度
+            "parallax_factor": (None if factor is None else round(float(factor), 4)),
             "qr_decoder": qr["decoder"], "qr_ms": round(float(qr["ms"]), 1),
             "qr_attempted": bool(qr["attempted"]),
             "qr_budget_exhausted": bool(qr["exhausted"] or self._qr_exhausted),
