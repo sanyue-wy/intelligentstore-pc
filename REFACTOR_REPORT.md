@@ -630,8 +630,10 @@ SCRIPT_EXIT2=0
   代价是这套 3 点拟合 scale=0.9783、平均 2.83mm、最大 4.23mm **超默认阈值**，
   所以比赛模式现在起不来（`fit_quality` 在 debug/race 都是 fail）——现场要么重标，要么显式放宽
   `gate_thresholds`。这与 A3 的验收要求一致，已写进 `FIELD_VERIFICATION_CHECKLIST.md`。
+- **单测与仿真 e2e 共享 `/tmp/is_competition.lock`（测试非密闭，不是功能缺陷）**：e2e 期间（`UI/run_competition.py:306` 建锁 → `:498` 删锁，整轮 16–20s 都持锁）跑 `python3 -m unittest vision.test_vision` 会得到 `FAILED (failures=1, errors=20)`（20 个 error 全是 `vision/service.py:170 _enforce_gates()` 抛「比赛模式 (存在锁文件) 视觉门禁不通过, 拒绝启动」，1 个是调试模式下的冲突告警用例）；删锁、或 `IS_COMPETITION_LOCK=<不存在的临时路径>` 后同一条命令全绿。**本报告「最终验收」第 1 条是串行跑的**（先删锁 → 跑 8 个模块 → 再跑 e2e）。结论：门禁在真实入口生效（这正是它的目的），代价是单测与 e2e 共享了全局锁状态；复核与现场跑测试时请串行化，或显式设 `IS_COMPETITION_LOCK`。
 - **越界拦截的边界声明**：只保证**上位机不把越界目标/坐标放进发送序列**；
   **不声称**修复下位机驱动器故障、固件 `参数超限` 判定、`ACM0→ACM1` 重枚举。
+- **PTY 证据的文档勘误（verifier 独立复现，以本条为准）**：本报告 A2 节的 PTY 表把 `goto_pass` 记为 `96 B / 3 帧`；verifier 用真 web 调试台 + 真 `communication` client 在 A3 树重测为 `pass = 192 B`（3 个 MOTION 帧 + 3 个轮询帧）、`reject = 0 B / 0 帧`。**「越界 = 一字节都没写出」这个判据两次独立测量一致**；放行侧的字节总数会随轮询帧数量浮动，引用时按「reject=0 B」为准，放行侧只看「MOTION 帧确实发出」。
 - **D3 现场历史（11-02 01:06 "参数超限"）**：被拒的到底是 XY 还是速度参数 → **无法确认**
   （没有对应 run 目录、scan json 里没有 mm 坐标、日志零命中；实测 `参数超限` 全部落在
   11-01 16:27–16:31）。不编结论。
