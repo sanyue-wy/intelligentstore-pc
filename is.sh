@@ -20,6 +20,10 @@ case "${1:-help}" in
               esac ;;
   run)        shift; exec "$D/start_competition.sh" "$@" ;;
   precheck)   docker exec -it $C bash -lc 'cd /app && python3 UI/precheck.py' ;;
+  gates)      # A3 视觉门禁 (11 项: 标定/成像/限位/位姿); 不改 precheck 语义 (那个仍走 UI/precheck.py)
+              # 默认 --check: 放行=0, 有 FAIL 项=非零; 现场也可 ./is.sh gates --seal 给参考点盖章
+              shift; A="$*"; [ -z "$A" ] && A="--check"
+              docker exec $C bash -lc "cd /app && python3 -m vision.gates $A" ;;
   convert)    shift; exec "$D/convert.sh" "$@" ;;
   doctor)     exec bash "$D/deploy/bpu_doctor.sh" ;;
   migrate)    # 迁移到 ubuntu:22.04 + BPU 挂载的新容器 (旧容器改名保留)
@@ -30,6 +34,7 @@ case "${1:-help}" in
     run              比赛程序前台运行 (待机 -> 启动键开始), 执行页 :8088
     race on|off      比赛模式开机自启 开/关 (systemd)
     precheck         赛前自检清单
+    gates [--seal]   视觉门禁 11 项 (标定/成像/限位/位姿); --seal = 给当前参考点盖章
   模型
     convert [参数]   一键转换 (先把 .pt 放进 vision/models/)
   调试 (全部网页, 笔记本浏览器访问)

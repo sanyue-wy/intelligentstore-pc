@@ -9,9 +9,10 @@
 #
 # 做了什么:
 #   1. 关闭网页调试台 / 调试工作台 (它们占用相机和串口, 且比赛中不能有遥控入口)
-#   2. 守护运行 UI/run_competition.py: 执行页「一键重启」(退出码 75) 或程序崩溃时自动拉起,
+#   2. 视觉门禁 (A3): 比赛模式 (存在锁文件) 下门禁不过就打印原因并退出非零, 不进守护循环
+#   3. 守护运行 UI/run_competition.py: 执行页「一键重启」(退出码 75) 或程序崩溃时自动拉起,
 #      回到待机; 正常退出 (Ctrl+C) 不再拉起
-#   3. 执行页: http://<X5_IP>:8088
+#   4. 执行页: http://<X5_IP>:8088
 # ============================================================================
 cd "$(dirname "$0")" || exit 1
 CONTAINER=${CONTAINER:-intelligentstoring}
@@ -42,7 +43,24 @@ sleep 0.5
 python3 -c "from vision.yolo_engine import is_bpu_available as f; print('BPU 运行库:', '可用' if f() else '不可用 (将退回 CPU, 宿主执行 deploy/bpu_doctor.sh 排查)')"
 echo "执行页: http://$(hostname -I 2>/dev/null | awk '{print $1}'):${IS_RUN_PAGE_PORT:-8088}"
 
-# 2) 守护运行
+# 2) 视觉门禁 (A3): 比赛模式 (存在锁文件) 下门禁不过 -> 打印原因并退出非零, 不进守护循环。
+#    为什么不丢进 while 里重试: 门禁不过 = 标定/成像/限位没配好, 2 秒一次无限重启只会刷屏,
+#    还会把「现场真正要做的动作」(参考点盖章 / 锁曝光增益白平衡 / 填限位) 淹没掉。
+#    修好后重新执行本脚本即可; 门禁自身异常时按锁文件判据放行, 不因门禁故障挡住比赛。
+LOCK=${IS_COMPETITION_LOCK:-/tmp/is_competition.lock}
+python3 -m vision.gates --check
+gate_code=$?
+if [ "$gate_code" != 0 ]; then
+    if [ -f "$LOCK" ]; then
+        echo "[比赛模式] 视觉门禁不通过 (退出码 $gate_code), 上面列出的 FAIL 项必须先处理 -> 不启动"
+        echo "           现场: ./is.sh gates        看门禁 11 项"
+        echo "                 ./is.sh gates --seal 给当前参考点盖章"
+        exit "$gate_code"
+    fi
+    echo "[警告] 视觉门禁检查异常 (退出码 $gate_code; 未发现锁文件 $LOCK, 按调试模式放行)"
+fi
+
+# 3) 守护运行
 while true; do
     python3 UI/run_competition.py "$@" 2>&1 | tee -a "$LOG"
     code=${PIPESTATUS[0]}

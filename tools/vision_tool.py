@@ -455,7 +455,8 @@ def cmd_web(args):
             _shared_client = _mk_client()
         except Exception:
             _shared_client = None
-        _webui_comm = CommDebug(_shared_client)
+        # A2: 把 calibrator 交给 /comm 页, MOVE 才能在发送前用 vision/limits.py 的同一检查函数拦越界
+        _webui_comm = CommDebug(_shared_client, calibrator=svc.calibrator)
         _webui_flow = FlowDebug(svc=svc, client=_shared_client, target_to_dict=t2d)
         log.info("调试台附加章节已就绪: 流程 / 通讯 / 完整过程")
     except Exception as e:
@@ -471,6 +472,16 @@ def cmd_web(args):
             # h = 点击处离托盘底面的高度。0 只验平面标定; 填实际抓取高度 (货物高 × parallax_factor)
             # 才会走透视位姿的高度投影, 这时夹爪对准的才是货物顶面中心而不是底面投影点。
             x, y = svc.calibrator.pixel_to_robot(float(u), float(v), float(h or 0.0))
+            # A2/A3: 发送前越界拦截 —— 与 scan() 的过滤、调试台 /comm MOVE 共用同一个检查函数
+            # (vision/limits.py::check_point, 闭区间, 唯一硬拦截项 robot_limits_mm)。
+            # 越界就不发 send_move (物理上不会走到下面), 页面用 g.error 显示中文原因与三套坐标。
+            verdict = svc.calibrator.check_robot_xy(x, y)
+            if not verdict.ok:
+                return {"ok": False, "target": [round(x, 1), round(y, 1)],
+                        "error": "机械臂限位拦截 (指令未下发): %s | 触发=%s 轴=%s | %s"
+                                 % (verdict.reason, verdict.trigger or "-",
+                                    "/".join(verdict.axes) or "-", verdict.text()),
+                        "limit": verdict.as_dict()}
             arm["task"] = 200 + (arm["task"] - 199) % 50
             tid = arm["task"]
             try:
@@ -564,6 +575,15 @@ def cmd_web(args):
             new = solve_hsv(color_samples, data.get("hsv", {}))
         except ValueError as e:
             return {"ok": False, "error": str(e)}
+        # A3 门禁 color_imaging: 记下这套 HSV 区间是在什么成像条件下采的。指纹与 vision/gates.py
+        # 的 imaging_fp() 是同一个函数 (曝光/增益/白平衡/分辨率/device/fourcc/swap_rb), 保证写读一致;
+        # 之后换照明、自动曝光漂了、或分辨率变了, 门禁立刻判"颜色标定与当前成像不一致"。
+        try:
+            from vision import gates as _gates
+            cam = dict(getattr(svc, "_cam_cfg", None) or getattr(svc.cfg, "camera", {}) or {})
+            new["imaging_fp"] = _gates.imaging_fp(cam)
+        except Exception as e:                    # 指纹算不出来不能挡住颜色标定本身
+            log.warning("imaging_fp 计算失败 (颜色区间仍会保存): %s", e)
         if os.path.exists(meta_path):
             import shutil
             shutil.copy(meta_path, meta_path + ".bak")

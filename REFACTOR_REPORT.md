@@ -145,3 +145,282 @@ grep -rn 'is_debug|intelligentstoring-debug@|python main.py' → NONE
 - 网页四节接**真机**、通讯页接**真 STM32**、自检提示是否贴合现场、参考点标定后「点哪去哪」误差、整轮比赛真实节拍——**均只在仿真验证过**，详见 `FIELD_VERIFICATION_CHECKLIST.md`。
 - `best_1027_640x480.onnx` 是否删除待用户确认。
 - 大屏推送服务（8756，`x5_remote_server.py`）不在本仓库，未改动其接口。
+
+## 视觉优化 A2：发送前越界拦截（限位）
+
+**提交**：`视觉A2:`（commit `76d00c8`；文件：`vision/limits.py`(新) / `vision/gates.py`(新) / `vision/calibration.py` /
+`vision/calib_config.json` / `vision/service.py` / `webui/comm_debug.py` / `vision/test_vision_gates.py`(新)）
+> `vision/gates.py` 随 A2 一起提交：`calibration.py` / `service.py` 顶层 import 它，缺它 A2 自身 import 会失败。
+
+**机制**　唯一检查函数 `vision/limits.py::check_point(x_mm, y_mm, limits, tray_margin_mm=None,
+tray_margin_action="warn", tray_xy=None)`，返回 `LimitVerdict(ok, trigger, axes, reason, warnings, detail)`；
+`detail` 恒带三套坐标（像素 `pixel_uv` / 托盘 `tray_xy` / 机械臂 `robot_xy`）与越界轴、阈值、来源。
+边界**闭区间** `x_min <= x <= x_max`。三个入口共用它：
+
+| 入口 | 调用点 | 越界行为 |
+| --- | --- | --- |
+| scan 返回前过滤 | `vision/service.py::_filter_limits` | 目标不进 `scan()` 返回值/总线/记录，`last_scan_rejects` 留档，调试图上红框 `LIMIT` |
+| 网页"点哪去哪" | `tools/vision_tool.py::goto()`（A6 handover 后接入） | 拒绝发送 + 页面提示（`{"ok":false,"error":"机械臂限位拦截 (指令未下发): ..."}`） |
+| 调试台 `/comm` MOVE | `webui/comm_debug.py::send()` | 拒绝发送 + 返回 `{"ok":false,"error":...}`，协议不变 |
+
+配置：`calib_config.json` 只**增键**（现场值原样保留）`robot_limits_mm`（默认 `null` = 不检查，**唯一硬拦截项**）、
+`tray_margin_mm`（默认 `null` = 关闭）、`tray_margin_action`（`warn`/`drop`，默认 `warn`）；
+环境变量覆盖 `IS_ROBOT_LIMITS="x_min,x_max,y_min,y_max"`、`IS_TRAY_MARGIN_MM`、`IS_TRAY_MARGIN_ACTION`。
+`robot_limits_mm` 写错/缺键时按"未配置"放行并 `logger.warning`（**不静默拦死**：配置打错一个字就抓不到货，
+比漏拦一次更糟；未配置由 A3 门禁 `robot_limits` 提示）。`communication/**`、`UI/**` 零改动。
+
+### A2.8 证据：越界帧有没有进发送序列
+
+**正向复现**（人为设一个极小限位，让"正常货物"必然越界）：
+
+```
+IS_CALIB_CONFIG=/tmp/a2_calib.json IS_ROBOT_LIMITS="-9999,-9998,-9999,-9998" \
+IS_COMPETITION_LOCK=/tmp/a2_e2e_nolock ALLOW_MOCK=1 USE_SYNTHETIC_CAM=1 START_SOURCES=auto \
+ONESHOT=1 EXPECTED_TOTAL=3 timeout 150 python3 UI/run_competition.py
+```
+
+时间轴（run `records/runs/20261103_140430`，`RUN_EXIT=0`）：
+
+```
+14:04:31,072 WARNING vision.service: 视觉限位拦截: 目标#1 蓝色四面体 像素(462.0,225.0) 托盘(128.1,127.3) 机械臂(138.6,72.3) 触发=robot_limits 轴=x,y 原因=x=138.6 超出 [-9999.0, -9998.0]; y=72.3 超出 [-9999.0, -9998.0]
+14:04:31,074 WARNING vision.service: 视觉限位拦截: 本次 1 件目标全部越界, 未返回任何目标 (触发=robot_limits) —— 不是空盘, 是限位/标定问题
+14:04:32,520 WARNING vision.service: 视觉限位拦截: 目标#1 蓝色四面体 像素(472.0,208.0) 托盘(135.0,121.2) 机械臂(133.3,66.5) 触发=robot_limits 轴=x,y ...
+14:04:32,523 WARNING vision.service: 视觉限位拦截: 目标#2 黄色四面体 像素(161.8,262.1) 托盘(24.5,106.4) 机械臂(121.6,161.6) 触发=robot_limits 轴=x,y ...
+14:04:32,524 WARNING vision.service: 视觉限位拦截: 本次 2 件目标全部越界, 未返回任何目标 (触发=robot_limits) —— 不是空盘, 是限位/标定问题
+14:04:32,527 INFO vision.service: scan: 5 帧 -> 0 件 (取图 167 ms, 识别 156 ms)
+14:04:32,541 INFO competition: 托盘无可识别货物, 抖料后重扫 (2/2)
+14:04:33,945 WARNING vision.service: 视觉限位拦截: 目标#1 蓝色四面体 像素(483.0,189.0) 托盘(143.0,114.1) 机械臂(127.1,59.6) 触发=robot_limits 轴=x,y ...
+14:04:33,963 INFO competition: === 分拣结束 (完成): 成功 0 件, 用时 3.2s ===
+```
+
+关键计数（同一份原始日志）：`视觉限位拦截` = **7** 行、`不是空盘` = **3** 行、
+`scan: 5 帧 -> 0 件` = **3** 次、UI 空盘行 `托盘无可识别货物, 抖料后重扫` = 2 行、
+**`competition: 抓取`（取件命令）= 0 行**、`PERMIT`/`move` = 0 行。
+`records/runs/20261103_140430/scan_001..003.json` 全是 `[]`（越界目标没有进返回值 → 没有进记录）；
+`report.json`：`total_done=0`、`items=[]`，`events[]` 里带 t=0.31/1.76/3.18 的拦截原文。
+
+**对照基线**（不设限位，同一份现场配置，run `records/runs/20261103_140442`，`RUN_EXIT=0`）：
+`视觉限位拦截` = 0；`scan: 5 帧 -> 1 件` = 3；取件命令 3 行：
+
+```
+14:04:43,135 INFO competition: 抓取 蓝色四面体 conf=0.60 mm=(138.6,72.3) -> 1 号盒
+14:04:50,350 INFO competition: 抓取 蓝色四面体 conf=0.59 mm=(100.5,52.4) -> 1 号盒
+14:04:56,232 INFO competition: 抓取 蓝色四面体 conf=0.66 mm=(107.2,70.8) -> 1 号盒
+14:04:56,232 ... === 分拣结束 (完成): 成功 3 件, 用时 19.5s ===
+```
+
+→ **未配置限位时行为与基线一致**（该发的一件不少发）。保留目标的
+`diagnostics.limit_checked/limit_ok/limit_configured` 落进 scan 记录：
+
+```
+scan_001.json -> diagnostics={"model_color":"blue","hsv_color":"blue",...,"limit_checked":true,"limit_ok":true,"limit_configured":false,"limit_trigger":"","limit_axes":[]}
+```
+
+**单测**（`vision/test_vision_gates.py`，28 tests OK）内含"越界时 `client.send_move` 根本没被调用"
+（`client.moves == []`）与"`scan()` 返回不含越界目标且 `last_scan_rejects` 有记录"两条硬断言 ——
+不满足只断言"调用了检查函数"。
+
+#### 另外两个发送入口（点哪去哪 / `/comm` MOVE）的端到端证据：上位机到底往串口写了几个字节
+本机没有下位机硬件，而 `tools/vision_tool.py --arm` 走 `communication/client.py::connect()`（只扫
+`/dev/ttyACM*`/`/dev/ttyUSB*`，**没有** ALLOW_MOCK 回退），所以第一轮测试里 `POST /api/goto`
+直接返回 `{"ok":false,"error":"未连接下位机 (启动时加 --arm)"}` —— **拦截函数根本没被走到**。第二轮改用
+**PTY 假串口**：`/tmp/a3_pty_bridge.py` 用 `pty.openpty()` + `tty.setraw(slave)` 把 slave 软链成
+`/dev/ttyACM9`，master 侧挂仓库自带的进程内 `MockSTM32`（`communication.mock_device`，**不改
+`communication/**`**），于是工具真的"连上了下位机"，而上位机写出的每一个字节都被落盘
+（`/tmp/a3_pty_<tag>_c2d.bin`），再用 `/tmp/a3_pty_analyze.py` 按 `protocol.py` 的 32B 帧格式
+（X/Y 为微米）解出命令帧。**越界时字节数应为 0**：
+
+| 用例 | 入口 | 限位 | 上位机发出的原始字节 | 命令帧 / MOTION | HTTP 响应 |
+| --- | --- | --- | --- | --- | --- |
+| `goto_reject` | `POST /api/goto (462,225)` | `-9999,-9998,-9999,-9998` | **0 B** | **0 / 0** | `{"ok":false,"target":[126.4,63.4],"error":"机械臂限位拦截 (指令未下发): x=126.4 超出 [-9999.0, -9998.0]; y=63.4 超出 … \| 触发=robot_limits 轴=x/y \| 像素(462.0,225.0) 托盘(?) 机械臂(126.4,63.4)"}` |
+| `goto_pass`（对照） | 同上 | `-9999,9999,-9999,9999` | 96 B | 3 / **1** | `{"ok":true,"target":[126.4,63.4],"reached":[126.4,63.4],"err_mm":0.04}` |
+| `comm_reject` | `POST /api/comm/send move x=500 y=500` | `-9999,-9998,-9999,-9998` | **0 B** | **0 / 0** | `{"ok":false,"cmd":"move","error":"坐标越界, 已拒绝发送 (x=500.0, y=500.0): …"}` |
+| `comm_pass`（对照） | 同上 `x=126.4 y=63.4` | `-9999,9999,-9999,9999` | 32 B | 1 / **1** | `{"ok":true,"cmd":"move"}` |
+
+两个对照用例解出的运动帧原文（`/tmp/a3_goto_analyze.txt`）：
+
+```
+== goto_pass     原始字节 96 B;  命令帧 3 个
+   [CLEAR   ] off=0      seq=11926 task_id=0
+   [MOTION] off=32     task_id=201  目标=(126.440, 63.400)mm timeout=10000ms
+   [CANCEL  ] off=64     seq=11928 task_id=201
+== comm_pass     原始字节 32 B;  命令帧 1 个
+   [MOTION] off=0      task_id=0    目标=(126.400, 63.400)mm timeout=10000ms
+== goto_reject   原始字节 0 B;  命令帧 0 个   --> 上位机一个运动指令都没发出去
+== comm_reject   原始字节 0 B;  命令帧 0 个   --> 上位机一个运动指令都没发出去
+```
+
+即：越界时**上位机连 CLEAR/POLL 都没写出去，`send_move` 一行字节都不存在**；而同一入口在范围内时
+确实会下发 MOTION（`task_id=201` 是点哪去哪的任务号、`task_id=0` 是 `/comm` 手动点动），证明拦截的
+是"发送"而不是"把入口整个弄坏"。原始输出：`/tmp/a3_goto_evidence.txt`（HTTP 响应）、
+`/tmp/a3_goto_analyze.txt`（帧解析）、`/tmp/a2_goto_evidence.txt`（合并版）、
+`/tmp/a3_tool_pty_{goto,comm}_{reject,pass}.log`（工具日志）。
+
+### A2 现场历史记录（11-02 01:06 "参数超限"）的检索结论
+
+**结论：无法确认当时被下位机拒绝的是 XY 坐标越界还是速度参数越界。** 依据：
+1. `records/runs/` **没有 01:06 那次 run**（现有：20261101_162657/163122/203540/210733、
+   20261102_003832/024631/024718/024845、20261103_…）；任务书提到的时间轴没有对应 run 目录。
+2. 11-02 的 26 个 `scan_NNN.json` 键集合 = `['bbox','category','conf','label','u','v']`，**没有任何 mm 坐标**。
+3. `/var/log/intelligentstoring/competition.log`：`grep '2026-11-02'` = 0 行、`grep '01:06:1'` = 0 行；
+   该日志里 `参数超限` 全部在 **11-01**：16:27:20 任务3 / 16:27:22 任务4 / 16:27:32 任务6 /
+   16:27:43 任务8 / 16:31:37 任务2 / 16:31:52 任务4（另有 16:27:10、16:31:36 `任务 1 失败: 前往取件点超时`）。
+4. 上表正向复现只证明"新拦截在越界时确实生效"，**不能**反推当时也能拦住。
+
+**边界声明（本项不做的事）**：本项只保证**上位机不把越界目标放进发送序列**；
+**不声称**修复下位机驱动器故障、固件 `参数超限`（坐标/速度）判定、`ACM0 -> ACM1` 重枚举这三类现场问题。
+
+**现场待验证**：`[现场待验证]` 真实托盘坐标系下的 `robot_limits_mm` 究竟该填多少（本机从未在实机上跑过 A2 的
+拦截路径，PTY 假串口只证明了协议层"越界不发帧"）；`tray_margin_mm` 取多少合适；真机串口上
+`/comm` MOVE 与"点哪去哪"的越界提示在浏览器里的实际观感。
+
+---
+
+## 视觉优化 A3：自检 + precheck 门禁
+
+**提交**：`视觉A3:`（文件：`is.sh`、`start_competition.sh`、A6 handover 后的 `tools/vision_tool.py`，
+以及把本节追加到 `REFACTOR_REPORT.md` 末尾）
+> `vision/gates.py` 与 `service.py` 的门禁 hunk 已随 A2 提交（无法在文件内拆分）。
+
+**11 条门禁**（`vision/gates.py::evaluate() -> GateReport`，每条有稳定 id / 级别 / 详情含数值与来源路径）：
+
+| id | 判据 | 调试缺省 | 比赛缺省 |
+| --- | --- | --- | --- |
+| ref_points | 参考点 <3；或**缺 `ref_points_fp` 指纹=按未标定**；或指纹≠当前=已过期 | warn | fail |
+| ref_collinear | 三点共线（三角面积比 / 最小内角，阈值 0.02 / 5°） | warn | fail |
+| fit_quality | 拟合比例出 0.97–1.03、平均误差 >2mm、单点最大 >4mm | fail | fail |
+| residual_poly | 残差多项式反而变大 → **自动不用残差** + warn（已真的生效：标定侧不再 apply） | warn | warn |
+| class_height | ≥80% 的类 `height_mm` 相同（占位值） | warn | warn |
+| imaging_locked | `camera.exposure_us`/`gain_db`/`wb_kelvin` 有 null（详情列出哪几个） | warn | fail |
+| intrinsics | 无 `camera_matrix`/`dist_coeffs` | warn | warn |
+| color_imaging | `color.source=="hsv"` 但缺 `hsv.imaging_fp` 或与当前成像指纹不一致 | warn | fail |
+| robot_limits | `robot_limits_mm` 未配置 | warn | warn |
+| pose | `estimate_pose()` 返回 `ok=False` | fail | fail |
+| cam_self | 焦距是托盘四角自估（`source=="self"`） | warn | warn |
+
+配置：`calib_config.json` 顶层 `gates: {"<id>":"off|warn|fail"}`（缺省 = 上表，按 `race_mode()` 选列；
+单条可覆盖；`IS_GATE_<ID>` 再覆盖；非法值 warning 后回落缺省）。阈值在顶层 `gate_thresholds`
+（`IS_GATE_TH_<KEY>` 可覆盖）。
+
+**指纹（D1：只比指纹，不比时间）**：`ref_points_fp` = sha1 前 12 位，输入 = 托盘四角 + 内参
+（`camera_matrix`/`dist_coeffs`）+ 分辨率 `image_size` + `tray.fixed_z_mm` + `tray.axes` + `tray.origin_mm`
+（后三项同样改变像素→机械臂映射）。写者是 `vision/calibration.py`：`set_tray_ref_points()` 存参考点时自动盖章，
+现场也可 `python3 -m vision.gates --seal` / `./is.sh gates --seal`。`ref_points_verified_at` 只显示，不参与判定
+（板上可能无 RTC）。
+
+**成像指纹 `hsv.imaging_fp` 的写入者（A6 handover 后接入）**：`color_imaging` 门禁判"颜色区间是不是在
+当前成像下调出来的"，所以写入者与判定必须**同一个函数**。`tools/vision_tool.py::color_solve()`（颜色页采样
+成功、写 `classes.json` 之前）新增：
+
+```python
+from vision import gates as _gates
+cam = dict(getattr(svc, "_cam_cfg", None) or getattr(svc.cfg, "camera", {}) or {})
+new["imaging_fp"] = _gates.imaging_fp(cam)      # = sha1(exposure_us|gain_db|wb_kelvin|W,H|device|fourcc|swap_rb)[:12]
+```
+
+即 `vision/gates.py::imaging_fp()` 同时用于写与读（`_g.check_color_imaging` 比对
+`gates.imaging_fp(vcfg.camera)`），口径一致；采样当时是什么曝光/增益/白平衡就记什么。几何那套
+（四角+内参+分辨率+`fixed_z_mm`+`axes`+`origin_mm`）是另一个指纹 `ref_points_fp`，两者不混。
+工具自带 `except Exception` 兜底：指纹算不出来只 warning，颜色区间照旧保存（不让辅助信息毁掉主流程）。
+`classes.json` 现在的**仓库现场版本仍然没有 `imaging_fp`**（所以验收 (a) 才会报"颜色未标定"）；
+只有现场在颜色页采一次样之后它才会出现 —— 这正是该门禁要捕捉的状态。
+
+### A3 验收实测（原始输出 `/tmp/a3_evidence.txt` 24.5KB）
+
+**(a) 用当前仓库 `calib_config.json` 跑自检** → `ok=False`，**problems 11 条**（不是"无"），要求的 6 项全命中：
+`参考点`（有 3 点但缺 `ref_points_fp`，当前应为 `622ef169ba5f`）/`颜色标定`（缺 `imaging_fp`）/
+`类别高度`（23/23=100% 都是 30.0mm）/`成像锁定`（三项 null）/`相机内参`（无 `camera_matrix`）/`限位未配置`。
+另 5 条为：`相机无图像`（自检时没开相机）、`标定重投影误差 2.8mm 偏大`、`拟合质量`（平均 2.83mm>2.0、单点最大 4.23mm>4.0）、
+`残差多项式`（2.834mm→2.834mm 无收益，已自动停用）、`托盘边距未配置`。
+门禁命令：调试模式 `通过 3 / 提醒 7 / 拦截 1`（唯一 FAIL=`fit_quality`）exit=1；比赛模式 4 条 FAIL
+（ref_points/fit_quality/imaging_locked/color_imaging）exit=1。
+> 口径说明：现场 `ref_points` 其实已有 3 个 manual 点，但 `calib_config.json` 里**没有 `ref_points_fp`** →
+> 按"指纹缺失 = 未标定/过期"处理（否则四角换过、参考点没重标也会被当成"已标定"）。
+> `fit_quality` 的 2.83mm 是现场四点与三点参考点几何不自洽造成的（单点最大 4.23mm），如实按 fail 报出。
+
+**(b) 比赛模式拒绝启动**（我自己的锁 `/tmp/a3_race.lock`，绝不碰共享锁）：
+真实入口 `python3 UI/run_competition.py` → **exit=1**，traceback：
+`UI/run_competition.py:282 boot → self.vision.start()` → `vision/service.py:170 start → self._enforce_gates()`
+→ `service.py:437 raise RuntimeError(msg)`，消息里逐条列出 4 条 FAIL。服务层同锁下
+`gate_report().race=True`、`start()` 抛 `RuntimeError`、`is_running=False`、`_grabber=None`（**拒绝时不去开相机**）。
+`start_competition.sh`（容器内实测）：建锁 → `[比赛模式] 视觉门禁不通过 (退出码 1), 上面列出的 FAIL 项必须先处理 -> 不启动`，
+**`SCRIPT_EXIT=1` 且没有进入 while 重启循环**（日志里没有"2 秒后自动重启"）。
+**删锁 → **`exit=0`，正常跑完 3 件 19.7s。
+
+**(c) 全达标配置必须放行**：`/tmp/fullpass/{calib_config.json,vision_config.json,classes.json}`（现场配置副本，
+只增改门禁要判的项：内参、`robot_limits_mm={0,240,0,240}`、与 axes/origin 几何自洽的三点参考点+盖章、
+`exposure_us/gain_db/wb_kelvin`、`color.imaging_fp`、逐类不同 `height_mm`），用
+`IS_VISION_CONFIG`/`IS_VISION_CLASSES`/`IS_CALIB_CONFIG` 指向它们（仓库现场文件零改动）→
+`python3 -m vision.gates --check` **exit=0**（比赛模式 `通过 10 / 提醒 1 / 拦截 0`，唯一 warn 是
+`residual_poly`："只有 3 个参考点、残差本就没启用"），真实 `UI/run_competition.py` **exit=0**、成功 3 件。
+`VisionService` 新增 `IS_VISION_CLASSES` 支持（构造 detector 时透传 `meta_path`，不改 `yolo_detector.py`）。
+
+**(c2) 现场盖章流程**：`--seal` 前 ref_points=warn（缺指纹）→ `--seal` 写入 `ref_points_fp=622ef169ba5f` →
+之后 ref_points=ok（"参考点 3 个, 指纹 622ef169ba5f 与当前配置一致(确认于 …)"）。现场就是 `./is.sh gates --seal`。
+
+**(d) 每条门禁可单独 `off|warn|fail`**（隔离实测：其余门禁全部 `off`，只留被测那条；现场配置 + 比赛模式）：
+
+| 门禁 | off | warn | fail |
+| --- | --- | --- | --- |
+| ref_points | off / exit 0 | warn / exit 0 | fail / **exit 1** |
+| fit_quality | off / exit 0 | warn / exit 0 | fail / **exit 1** |
+| residual_poly | off / exit 0 | warn / exit 0 | fail / **exit 1** |
+| class_height | off / exit 0 | warn / exit 0 | fail / **exit 1** |
+| imaging_locked | off / exit 0 | warn / exit 0 | fail / **exit 1** |
+| intrinsics | off / exit 0 | warn / exit 0 | fail / **exit 1** |
+| color_imaging | off / exit 0 | warn / exit 0 | fail / **exit 1** |
+| robot_limits | off / exit 0 | warn / exit 0 | fail / **exit 1** |
+| ref_collinear / pose / cam_self（本身达标） | off / exit 0 | ok / exit 0 | ok / exit 0 |
+
+即：**拦截只发生在"条件不达标 且 级别=fail"**；`off` 一律不参与，`warn` 只提示不改退出码。
+
+**(e) 指纹过期**：改 `corners` / `camera_matrix` / `dist_coeffs` / `image_size` / `fixed_z_mm` / `axes` /
+`origin_mm` 各一次（副本上）→ **7/7 全部判"参考点已过期"**，指纹从 `9dab9f6bfb4b` 变为 7 个互不相同的新值。
+
+### A3 启动脚本门禁路径（容器内真机实测原文）
+
+`start_competition.sh` 的门禁块在 `while true` **之前**（第 46–61 行），容器内实测（原始输出 `/tmp/a3_script_evidence.txt`）：
+
+```
+$ docker exec intelligentstoring bash -lc 'cd /app && touch /tmp/a3_race.lock && IS_COMPETITION_LOCK=/tmp/a3_race.lock ./start_competition.sh'
+BPU 运行库: 可用
+执行页: http://10.68.246.162:8088
+视觉门禁 (比赛模式, 共 11 项): 通过 3 / 提醒 4 / 拦截 4
+[FAIL] ref_points       参考点未标定: 有 3 个参考点但 calib_config.json 缺 ref_points_fp 指纹, ... 当前应为 622ef169ba5f ...
+[FAIL] fit_quality      平均重投影误差 2.83mm > 2.0mm; 单点最大误差 4.23mm > 4.0mm
+[FAIL] imaging_locked   成像未锁定: exposure_us, gain_db, wb_kelvin 为 null ...
+[FAIL] color_imaging    颜色未标定: 有 hsv 区间但缺 imaging_fp ...
+比赛模式 (锁文件存在): 有拦截项就必须停下来, 不要带着 4 项 fail 开赛
+[比赛模式] 视觉门禁不通过 (退出码 1), 上面列出的 FAIL 项必须先处理 -> 不启动
+           现场: ./is.sh gates        看门禁 11 项
+                 ./is.sh gates --seal 给当前参考点盖章
+SCRIPT_EXIT=1                      # 且日志里没有任何 "2 秒后自动重启" -> 确认没有进 while 循环
+```
+
+删锁后同一脚本（`ONESHOT=1 EXPECTED_TOTAL=3 ALLOW_MOCK=1 USE_SYNTHETIC_CAM=1`）放行：
+
+```
+2026-11-03 14:12:26,050 INFO competition: ✔ 第 3 件 蓝色四面体 完成, 用时 6.2s
+2026-11-03 14:12:26,054 INFO competition: === 分拣结束 (完成): 成功 3 件, 用时 19.7s ===
+[比赛模式] 程序正常退出
+SCRIPT_EXIT2=0
+```
+
+`./is.sh gates`（宿主入口，实际进容器跑 `python3 -m vision.gates --check`）与 `./is.sh gates --seal`
+（在容器内副本上盖章 `ref_points_fp=622ef169ba5f` 后该门禁转 `ok`）同样实测通过；现场
+`vision/calib_config.json` 的 `ref_points_fp` 仍**不存在**（我的所有跑测都走 `/tmp` 副本）。
+
+### 取舍与说明
+
+- **`start_competition.sh` 门禁失败不丢进 while 重启循环**：门禁不过 = 标定/成像/限位没配好，
+  2 秒一次无限重启只会刷屏，并把"现场真正要做的动作"（参考点盖章 / 锁曝光增益白平衡 / 填限位）淹没。
+  现在直接打印失败项并 `exit 1`，修好后重跑脚本即可。门禁自身异常（非零但不是配置问题）时按锁文件判据：无锁放行、有锁拦。
+- **不改 `UI/**`**：拒绝启动通过 `VisionService.start()` 抛异常实现，`run_competition.py` 不动；
+  `UI/precheck.py` 的退出码只由 `level=="error"` 决定，门禁项文本含"标定/相机"等关键词 → 走它既有的分组，
+  其余兜底进"视觉配置"(warn)，**不会**产生新的 error。现场看门禁用 `./is.sh gates`（11 项全列）。
+- **`python3 -m vision.gates` 有一行 `RuntimeWarning: 'vision.gates' found in sys.modules ...`**：
+  `vision/__init__.py` 会导入 calibration → gates，属无害噪音，不影响退出码（已实测 exit 0/1 正确）。
+
+**现场待验证**：`[现场待验证]` 实机 `ref_points_fp` 盖章后的数值、以及曝光/增益/白平衡锁定量；
+`class_height` 逐类高度真值只能回实验室量；颜色页采样后写出的 `hsv.imaging_fp` 在实机照明下
+是否一次就与 `vision_config.json` 的 camera 段一致（本机是用合成相机验证的读写同源）。
