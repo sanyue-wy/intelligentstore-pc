@@ -131,9 +131,13 @@ class _EnvGuard(unittest.TestCase):
         self.addCleanup(self._restore)
 
     def _restore(self):
+        # A3.1: 先把本 fixture 管辖的所有键清掉 (含测试中途新设的), 再复原进来时的值 ——
+        # 否则测试里新设的 IS_ROBOT_LIMITS 之类会泄漏给后面的测试。
         for k in list(os.environ):
             if k.startswith("IS_GATE_"):
                 os.environ.pop(k, None)
+        for k in (_LOCK_ENV,) + _IS_PREFIXES:
+            os.environ.pop(k, None)
         for k, v in self._saved.items():
             if v is not None:
                 os.environ[k] = v
@@ -552,6 +556,74 @@ class GateLevelMatrixTest(_EnvGuard):
         gr = svc.gate_report()
         self.assertEqual(len(gr.items), 11)
         self.assertTrue(gr.fails, "现场配置应至少有 fail 级门禁项")
+
+    # ---- A3.1: robot_limits 必须与运行期 (limits.py) 用同一个"有效限位来源" ----
+    def _robot_limits_item(self, calib, race=False):
+        """离线跑一次门禁, 取 robot_limits 那一项 (不经过 service, 不受现场文件影响)。"""
+        cpath = write_json(os.path.join(self.tmp, "calib_config.json"), calib)
+        vpath = write_json(os.path.join(self.tmp, "vision_config.json"), {"camera": {}})
+        kpath = write_json(os.path.join(self.tmp, "classes.json"), base_classes())
+        ctx = G.build_context(calib_path=cpath, vision_config_path=vpath,
+                              classes_path=kpath, env={})
+        rep = G.evaluate(ctx, race=race)
+        return {i.id: i for i in rep.items}["robot_limits"]
+
+    def test_robot_limits_env_only_is_not_reported_as_missing(self):
+        """只有 IS_ROBOT_LIMITS (文件里 robot_limits_mm=null) 时不能报"未配置/不会拦截"。
+
+        改前这里会打印"机械臂限位未配置 ... 发送前不会拦截越界坐标", 而同一进程里
+        limits.py 真的会拦 (verifier 报告 #10 的 P2 假陈述)。
+        """
+        os.environ["IS_ROBOT_LIMITS"] = "100,121,0,200"
+        it = self._robot_limits_item(base_calib())
+        self.assertIn("IS_ROBOT_LIMITS", it.text, "文案必须点明限位来自环境变量")
+        self.assertNotIn("未配置", it.text)
+        self.assertNotIn("不会拦截", it.text)
+        self.assertFalse(it.blocks)
+        self.assertIn(it.level, ("ok", "warn"))
+        self.assertEqual(it.detail["source"], "env")
+        self.assertEqual(it.detail["parsed"],
+                         {"x_min": 100.0, "x_max": 121.0, "y_min": 0.0, "y_max": 200.0})
+        self.assertIsNone(it.detail["file_limits"])
+
+    def test_robot_limits_env_overrides_file_like_limits_py(self):
+        """文件与 env 同时存在时, 门禁的结论必须跟 limits.py 完全一致 (env > 文件)。"""
+        os.environ["IS_ROBOT_LIMITS"] = "100,121,0,200"
+        it = self._robot_limits_item(base_calib(
+            robot_limits_mm={"x_min": 0, "x_max": 160, "y_min": 0, "y_max": 190}))
+        self.assertFalse(it.blocks)
+        self.assertEqual(it.detail["source"], "env")
+        self.assertEqual(it.detail["parsed"]["x_max"], 121.0)
+        self.assertEqual(it.detail["file_limits"]["x_max"], 160.0)
+        self.assertIn("覆盖", it.text)
+        # 与运行期同口径: 121.0 之内的点放行, 文件里的 160.0 不再被当作上限
+        eff = it.detail["parsed"]
+        self.assertTrue(L.check_point(120.0, 50.0, limits=eff).ok)
+        self.assertFalse(L.check_point(130.0, 50.0, limits=eff).ok)
+
+    def test_robot_limits_file_only_and_broken_env_falls_back(self):
+        """只文件 -> source=file 且不提 env; env 写坏 -> limits.py 忽略它, 回落文件。"""
+        it = self._robot_limits_item(base_calib(
+            robot_limits_mm={"x_min": 0, "x_max": 160, "y_min": 0, "y_max": 190}))
+        self.assertFalse(it.blocks)
+        self.assertEqual(it.detail["source"], "file")
+        self.assertNotIn("IS_ROBOT_LIMITS", it.text)
+
+        os.environ["IS_ROBOT_LIMITS"] = "1,2"          # 不是 4 个数 -> 与 limits.py 一样当没设
+        it2 = self._robot_limits_item(base_calib(
+            robot_limits_mm={"x_min": 0, "x_max": 160, "y_min": 0, "y_max": 190}))
+        self.assertEqual(it2.detail["source"], "file")
+        self.assertIsNone(it2.detail["env_limits"])
+        self.assertFalse(it2.blocks)
+
+        # 文件与 env 都没有 -> 这时才允许说"未配置", 且要写清两种来源都查了
+        # (robot_limits 缺省级别 = warn/调试 warn/比赛 warn, 所以这里断言 warn 而不是 blocks)
+        os.environ.pop("IS_ROBOT_LIMITS", None)
+        it3 = self._robot_limits_item(base_calib(), race=True)
+        self.assertEqual(it3.level, "warn")
+        self.assertIn("未配置", it3.text)
+        self.assertIn("IS_ROBOT_LIMITS", it3.text)
+        self.assertEqual(it3.detail["source"], "none")
 
 
 # ---------------------------------------------------------------------------- A3: 启动门禁

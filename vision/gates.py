@@ -557,16 +557,32 @@ def _g_color_imaging(ctx: Ctx, th: Dict[str, float]) -> Tuple[Optional[bool], st
 def _g_robot_limits(ctx: Ctx, th: Dict[str, float]) -> Tuple[Optional[bool], str, Dict[str, Any]]:
     from . import limits as limitsmod
     raw = ctx.calib_data.get("robot_limits_mm")
-    lim = limitsmod.parse_limits(raw)
-    margin = ctx.tray_cfg.get("margin_mm")
-    det = {"robot_limits_mm": raw, "parsed": lim,
-           "tray_margin_mm": ctx.calib_data.get("tray_margin_mm"),
-           "tray_margin_action": ctx.calib_data.get("tray_margin_action") or "warn"}
+    # A3.1: 有效限位必须和运行期用**同一个**来源与优先级 (IS_ROBOT_LIMITS > 文件),
+    # 所以直接调 limits.py 的 limits_from_config(), 不在本文件另写一套解析 ——
+    # 否则会出现"门禁说没配置、运行时却在真拦"的自相矛盾 (verifier 报告 #10)。
+    lim, margin, action = limitsmod.limits_from_config(ctx.calib_data)
+    env_lim = limitsmod.limits_from_env()
+    file_lim = limitsmod.parse_limits(raw)
+    source = "env" if env_lim is not None else ("file" if file_lim is not None else "none")
+    det = {"robot_limits_mm": raw, "parsed": lim, "source": source,
+           "file_limits": file_lim, "env_limits": env_lim,
+           "tray_margin_mm": margin, "tray_margin_action": action}
     if lim is None:
-        return False, ("机械臂限位未配置 (robot_limits_mm=null): 发送前不会拦截越界坐标 "
+        return False, ("机械臂限位未配置 (calib_config.json 里 robot_limits_mm=null, "
+                       "也没有 IS_ROBOT_LIMITS 环境变量): 发送前不会拦截越界坐标 "
                        "(调试够用; 比赛前建议填 {x_min,x_max,y_min,y_max})"), det
-    return True, ("机械臂限位 x[%.1f,%.1f] y[%.1f,%.1f]" % (lim["x_min"], lim["x_max"],
-                                                            lim["y_min"], lim["y_max"])), det
+    text = ("机械臂限位 x[%.1f,%.1f] y[%.1f,%.1f]" % (lim["x_min"], lim["x_max"],
+                                                     lim["y_min"], lim["y_max"]))
+    if source == "env":
+        if file_lim is None:
+            text += (" (来自环境变量 IS_ROBOT_LIMITS, 文件里 robot_limits_mm=%s; "
+                     "只在设了该变量的进程里生效, 比赛脚本不会设它)" % (
+                         "null" if raw is None else json.dumps(raw, ensure_ascii=False)))
+        else:
+            text += (" (环境变量 IS_ROBOT_LIMITS 覆盖了文件值 x[%.1f,%.1f] y[%.1f,%.1f]; "
+                     "优先级 env > 文件, 与 limits.py 一致)" % (
+                         file_lim["x_min"], file_lim["x_max"], file_lim["y_min"], file_lim["y_max"]))
+    return True, text, det
 
 
 def _g_pose(ctx: Ctx, th: Dict[str, float]) -> Tuple[Optional[bool], str, Dict[str, Any]]:
