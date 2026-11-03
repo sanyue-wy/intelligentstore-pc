@@ -22,10 +22,12 @@ def _finite(v):
 
 
 class CommDebug:
-    def __init__(self, client=None):
+    def __init__(self, client=None, calibrator=None):
         self._lock = threading.Lock()
         self.logs = []
         self.client = client
+        # A2: 有了标定器就能在发 MOVE 之前用 vision.limits 的同一个检查函数判越界
+        self.calibrator = calibrator
         if self.client is None:
             try:
                 from communication import create_comm_client
@@ -147,6 +149,37 @@ class CommDebug:
         with self._lock:
             return list(self.logs[-n:])
 
+    # ---------------------------------------------------------------- 限位 (A2)
+    def _limit_verdict(self, x, y):
+        """
+        发送 MOVE 之前的越界判定 —— 与 scan 过滤 / 网页「点哪去哪」用的是
+        vision.limits 里同一个检查函数 (check_point / check_robot_xy)。
+        没有 vision 包或读不到配置时返回 None (不做拦截, 与基线行为一致)。
+        """
+        try:
+            from vision import limits as limitsmod
+        except Exception:
+            return None
+        if self.calibrator is not None:
+            try:
+                return self.calibrator.check_robot_xy(x, y)
+            except Exception as e:
+                self._log("ev", "限位检查异常 (不拦截): %s" % e)
+                return None
+        try:
+            import json
+            import os
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            path = os.environ.get("IS_CALIB_CONFIG") or os.path.join(root, "vision", "calib_config.json")
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            lim, margin, action = limitsmod.limits_from_config(data)
+            return limitsmod.check_point(x, y, limits=lim, tray_margin_mm=margin,
+                                         tray_margin_action=action, source="comm")
+        except Exception as e:
+            self._log("ev", "限位检查异常 (不拦截): %s" % e)
+            return None
+
     # ---------------------------------------------------------------- 命令
     def send(self, body):
         c = self.client
@@ -167,6 +200,16 @@ class CommDebug:
             slot = int(body.get("slot") or 0)
         except (TypeError, ValueError):
             slot = 0
+        if cmd == "move":
+            # A2: 越界目标不许进发送序列 —— 拦在 send_move 之前, 帧格式/协议不动
+            v = self._limit_verdict(x, y)
+            if v is not None:
+                for w in (v.warnings or []):
+                    self._log("ev", "限位提示: %s" % w)
+                if not v.ok:
+                    self._log("ev", "限位拦截 /comm MOVE x=%.1f y=%.1f: %s" % (x, y, v.reason))
+                    return {"ok": False, "cmd": cmd, "limit": v.as_dict(),
+                            "error": "坐标越界, 已拒绝发送 (x=%.1f, y=%.1f): %s" % (x, y, v.reason)}
         table = {
             "clear": lambda: c.send_clear(),
             "estop": lambda: c.send_estop(),

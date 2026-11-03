@@ -53,6 +53,7 @@ import json
 import logging
 import os
 import threading
+import time
 from typing import List, Optional, Tuple
 
 import cv2
@@ -60,6 +61,8 @@ import numpy as np
 
 from .interfaces import VisionCalibrator
 from . import tray as traymod
+from . import limits as limitsmod          # A2: 发送前越界拦截 (唯一检查函数)
+from . import gates as gatesmod            # A3: 参考点指纹 / 门禁阈值
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +80,9 @@ class CoordinateCalibrator(VisionCalibrator):
 
     def __init__(self, config_path: Optional[str] = None):
         self._lock = threading.RLock()
-        self.config_path = config_path or os.path.join(
+        # 标定文件路径优先级: 显式参数 > IS_CALIB_CONFIG > vision/calib_config.json
+        # (IS_CALIB_CONFIG 供现场用另一份标定/验收配置跑, 不动仓库现场文件)
+        self.config_path = config_path or os.environ.get("IS_CALIB_CONFIG") or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "calib_config.json")
         self.transform_matrix: Optional[np.ndarray] = None
         self.inverse_matrix: Optional[np.ndarray] = None
@@ -92,6 +97,15 @@ class CoordinateCalibrator(VisionCalibrator):
         self.principal_px: Optional[Tuple[float, float]] = None
         self.image_size: Optional[Tuple[int, int]] = None   # 标定时的画面 (宽, 高)
         self.is_calibrated: bool = False                    # 是否来自真实标定文件
+
+        # ---- A2/A3: 限位 + 门禁输入 (calib_config.json 顶层; 现场值原样保留, 这里的默认不改文件)
+        self.raw_config: dict = {}                          # 原始标定文件 (门禁要读 gates/robot_limits_mm/ref_points_fp)
+        self.robot_limits_mm: Optional[dict] = None         # {x_min,x_max,y_min,y_max} | None=不检查 (唯一硬拦截项)
+        self.tray_margin_mm: Optional[float] = None         # 托盘内框外扩 mm | None=不检查
+        self.tray_margin_action: str = "warn"               # warn=只提示 / drop=也拦截
+        self.gates_cfg: dict = {}                           # A3: {"<门禁id>": "off|warn|fail"}
+        self.ref_points_fp: Optional[str] = None            # A3: 参考点指纹 (只比指纹, 不比时间)
+        self.ref_points_verified_at: Optional[str] = None   # A3: 只作展示 (板子可能没有 RTC)
 
         # ---- 托盘坐标系模式
         self.tray_cfg: dict = traymod.merge_cfg(None)
@@ -205,6 +219,74 @@ class CoordinateCalibrator(VisionCalibrator):
             u, v = float(img[0, 0, 0]), float(img[0, 0, 1])
         return round(u, 1), round(v, 1)
 
+    # ------------------------------------------------------------------ 发送前限位 (A2)
+    def limit_cfg(self):
+        """当前生效的限位配置 (calib_config.json 顶层 + IS_* 覆盖)。"""
+        return self.robot_limits_mm, self.tray_margin_mm, self.tray_margin_action
+
+    def check_robot_xy(self, x_mm: float, y_mm: float):
+        """
+        MOVE 类入口 (网页「点哪去哪」/ `/comm` 手动 MOVE) 发指令之前调用。
+        返回 limits.LimitVerdict: ok=False 就**不要发送**。
+        """
+        lim, margin, action = self.limit_cfg()
+        return limitsmod.check_robot_xy(x_mm, y_mm, limits=lim, tray_margin_mm=margin,
+                                        tray_margin_action=action, calibrator=self, source="move")
+
+    def check_target(self, target, height_mm: float = 0.0):
+        """scan 的识别目标 -> 越界判定 (像素/托盘坐标由本标定器换算, 机械臂坐标用目标自带值)。"""
+        lim, margin, action = self.limit_cfg()
+        return limitsmod.check_target(target, calibrator=self, limits=lim, tray_margin_mm=margin,
+                                      tray_margin_action=action, height_mm=height_mm)
+
+    def limit_notes(self) -> List[str]:
+        """自检用的"限位"提示 (A2): 未配置要报 WARN, 但不能报 error (会影响 UI/precheck.py 退出码)。"""
+        notes = []
+        if self.robot_limits_mm is None:
+            notes.append("限位未配置 (robot_limits_mm=null): 发送前不拦截越界坐标, "
+                         "只在发送后由下位机报参数超限; 比赛前建议填 {x_min,x_max,y_min,y_max} "
+                         "(IS_ROBOT_LIMITS=\"x_min,x_max,y_min,y_max\" 可临时覆盖)")
+        elif self.raw_config.get("robot_limits_mm") is None:
+            notes.append("限位来自环境变量 IS_ROBOT_LIMITS (文件里没写): 确认这是现场要用的范围")
+        if self.tray_margin_mm is None:
+            notes.append("托盘边距未配置 (tray_margin_mm=null): 不做托盘外拦截 (自动 ROI 已挡住大部分)")
+        return notes
+
+    # ------------------------------------------------------------------ 参考点指纹 (A3/D1)
+    def current_ref_points_fp(self) -> str:
+        """当前配置应带的参考点指纹 (只看映射依赖的六项, 不看时间)。"""
+        return gatesmod.ref_points_fp(self.raw_config)
+
+    def seal_ref_points(self, stamp: Optional[str] = None, persist: bool = True) -> dict:
+        """
+        现场确认参考点: 把当前指纹写进 calib_config.json (只改 ref_points_fp /
+        ref_points_verified_at, 其它键原样保留)。改四角/内参/分辨率/高度/axes/origin 后
+        指纹就对不上 -> ref_points 门禁判过期, 必须重新确认。
+        """
+        fp = self.current_ref_points_fp()
+        self.ref_points_fp = fp
+        if stamp is not None:
+            self.ref_points_verified_at = stamp
+        if persist:
+            data = {}
+            if os.path.exists(self.config_path):
+                try:
+                    with open(self.config_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
+            data["ref_points_fp"] = fp
+            if stamp is not None:
+                data["ref_points_verified_at"] = stamp
+            tmp = self.config_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            os.replace(tmp, self.config_path)
+            self.raw_config = data
+        return {"ok": True, "ref_points_fp": fp, "path": self.config_path,
+                "at": self.ref_points_verified_at}
+
     # ------------------------------------------------------------------ 持久化
     @_locked
     def save_config(self):
@@ -251,6 +333,14 @@ class CoordinateCalibrator(VisionCalibrator):
         try:
             with open(self.config_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            # A2/A3: 顶层新增键 (现场值不在 save_config 的已知键里, 因此不会被写回时冲掉;
+            # 这里只是把它们读进内存供 scan 拦截 / 门禁使用)
+            self.raw_config = data
+            self.robot_limits_mm, self.tray_margin_mm, self.tray_margin_action = \
+                limitsmod.limits_from_config(data)
+            self.gates_cfg = dict(data.get("gates") or {})
+            self.ref_points_fp = data.get("ref_points_fp")
+            self.ref_points_verified_at = data.get("ref_points_verified_at")
             if data.get("camera_matrix") is not None:
                 self.camera_matrix = np.array(data["camera_matrix"], dtype=np.float64)
                 self.dist_coeffs = np.array(data.get("dist_coeffs", [0, 0, 0, 0, 0]), dtype=np.float64)
@@ -394,7 +484,35 @@ class CoordinateCalibrator(VisionCalibrator):
         A = np.eye(3)
         A[:2, :2], A[:2, 2] = rig["R"], rig["t"]
         pred = (P @ rig["R"].T + rig["t"]) if len(P) else P
-        self.tray_residual = traymod.fit_residual(pred, Q, cfg.get("residual", "auto")) if len(P) else None
+        res = traymod.fit_residual(pred, Q, cfg.get("residual", "auto")) if len(P) else None
+        # A3 residual_poly: 残差多项式要真的把平均误差做小才留着; 反而变大就自动停用
+        # (停用 = self.tray_residual 置 None, 后面 pixel_to_robot 的 apply_residual 变成空操作),
+        # 门禁 residual_poly 只负责把这件事报出来。
+        self.tray_residual = res
+        after = []
+        if len(P):
+            before = [float(np.hypot(float(p[0]) - q[0], float(p[1]) - q[1])) for p, q in zip(pred, Q)]
+            for p, q in zip(pred, Q):
+                x, y = traymod.apply_residual(res, float(p[0]), float(p[1]))
+                after.append(float(np.hypot(x - q[0], y - q[1])))
+            min_gain = float(gatesmod.THRESHOLD_DEFAULTS["residual_min_gain_mm"])
+            try:
+                min_gain = float(gatesmod.thresholds_from(self.raw_config)["residual_min_gain_mm"])
+            except Exception:
+                pass
+            eff = {"order": int((res or {}).get("order", 0)),
+                   "without_mm": round(float(np.mean(before)), 3),
+                   "with_mm": round(float(np.mean(after)), 3),
+                   "applied": res is not None, "min_gain_mm": min_gain}
+            if res is not None and (eff["without_mm"] - eff["with_mm"]) < min_gain:
+                eff["applied"] = False
+                eff["reason"] = (f"开残差后平均误差 {eff['with_mm']}mm 未比不开的 "
+                                 f"{eff['without_mm']}mm 低 {min_gain}mm, 已自动停用")
+                self.tray_residual = res = None
+                after = before
+                logger.warning("残差多项式无收益, 已自动停用: %.3fmm -> %.3fmm (阈值 %.3fmm)",
+                               eff["without_mm"], eff["with_mm"], min_gain)
+            self.tray_status["residual_effect"] = eff
         self.transform_matrix = A @ self.tray_H
         self.inverse_matrix = np.linalg.inv(self.transform_matrix)
         self.src_pixels = corners.astype(np.float32)
@@ -421,7 +539,8 @@ class CoordinateCalibrator(VisionCalibrator):
         """托盘四角 (去畸变像素, 高度 z0) -> 相机位姿; 求不出返回 None (退回旧视差公式)。"""
         cfg = self.tray_cfg
         if str(cfg.get("perspective", "auto")).lower() == "off":
-            self.tray_status["perspective"] = {"method": "radial", "msg": "已关闭透视位姿 (perspective=off)"}
+            self.tray_status["perspective"] = {"method": "radial", "ok": None,
+                                              "msg": "已关闭透视位姿 (perspective=off)"}
             return None
         wh = self._frame_wh()
         c = self._principal() or ((wh[0] / 2.0, wh[1] / 2.0) if wh else None)
@@ -434,6 +553,8 @@ class CoordinateCalibrator(VisionCalibrator):
         except Exception as e:                                             # 退化四边形等
             pose = {"ok": False, "msg": f"位姿求解失败: {e}"}
         info = {k: pose.get(k) for k in ("tilt_deg", "height_mm", "source", "msg")}
+        # A3 pose 门禁: 明确记下位姿是否求解成功 (None=没启用位姿, 不拦截)
+        info["ok"] = bool(pose.get("ok"))
         if pose.get("ok"):
             info.update(method="pose", f_px=round(pose["f"], 1))
             if self.cam_height_mm and pose.get("source") != "cam_height" \
@@ -505,6 +626,11 @@ class CoordinateCalibrator(VisionCalibrator):
             refs.append({"tray_mm": [round(xt, 2), round(yt, 2)], "robot_mm": [float(x), float(y)], "src": "click"})
         self.tray_cfg["ref_points"] = refs
         self._compute_tray_matrix()
+        # A3: 人刚点完参考点 -> 用当前四角/内参/分辨率重新盖章 (之后改任一项都会判过期)
+        try:
+            self.seal_ref_points(stamp=time.strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception as e:
+            logger.warning("参考点指纹写入失败 (不影响标定): %s", e)
         return self.tray_status
 
     @_locked

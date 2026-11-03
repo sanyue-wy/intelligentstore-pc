@@ -35,13 +35,21 @@ from MessegeCenter.topics import (
 
 from .calibration import CoordinateCalibrator
 from .cameras import FrameGrabber, PhysicalCamera, apply_controls, create_camera
-from .config import VisionConfig, load_vision_config, race_mode
+from .config import (
+    VisionConfig, competition_lock_path, load_vision_config, race_mode,
+)
 from .detector import WorkpieceDetector
 from .interfaces import (
     VisionBackend, VisionCapabilities, VisionServiceBase, register_vision_backend,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _limits():
+    """延迟取 A2 的限位模块 (vision.limits): 函数级导入, 避免装配期的循环依赖。"""
+    from . import limits as limitsmod
+    return limitsmod
 
 
 class VisionService(VisionServiceBase):
@@ -55,7 +63,7 @@ class VisionService(VisionServiceBase):
         self.bus = bus
         self.cfg = config or load_vision_config()
         self.calibrator = CoordinateCalibrator()
-        self.detector = (detector_factory or WorkpieceDetector)(self.calibrator)
+        self.detector = self._make_detector(detector_factory)
         self.continuous_detect = continuous_detect
 
         self._cam_cfg: Dict[str, Any] = dict(self.cfg.camera)
@@ -69,6 +77,8 @@ class VisionService(VisionServiceBase):
         self._latest_targets: List[VisionTarget] = []
         self._fps = 0.0
         self.last_scan: Dict[str, Any] = {}
+        # A2: 上一次 scan 被限位拦下的目标 (列表, 供调试台/复盘取证据); scan() 返回结构不变
+        self.last_scan_rejects: List[Dict[str, Any]] = []
         self.warnings: List[str] = list(self.cfg.warnings)   # 启动时的配置告警, 不再追加运行期事件
         self._tray_event: tuple = (0.0, "")
 
@@ -77,6 +87,26 @@ class VisionService(VisionServiceBase):
         self._rec_q: "queue.Queue" = queue.Queue(maxsize=8)
         self._rec_thread: Optional[threading.Thread] = None
         self._rec_n = 0
+
+    # ================================================================== A2/A3 装配
+    def _make_detector(self, detector_factory=None):
+        """构造识别器。
+
+        A3 验收要能"用 /tmp 里的全达标配置放行"而**不动仓库现场文件**, 所以这里支持
+        IS_VISION_CLASSES 指向另一份 classes.json (meta_path)。yolo 后端接受 meta_path;
+        不接受该参数的工厂退回原样构造 (行为与基线一致), 只是类别表仍用默认路径。
+        """
+        factory = detector_factory or WorkpieceDetector
+        meta = os.environ.get("IS_VISION_CLASSES") or None
+        if not meta:
+            return factory(self.calibrator)
+        try:
+            det = factory(self.calibrator, meta_path=meta)
+            logger.warning("视觉类别表被 IS_VISION_CLASSES 覆盖: %s", meta)
+            return det
+        except TypeError:
+            logger.warning("该识别器工厂不接受 meta_path, IS_VISION_CLASSES 仅用于门禁判据: %s", meta)
+            return factory(self.calibrator)
 
     # ================================================================== 状态
     @property
@@ -137,6 +167,7 @@ class VisionService(VisionServiceBase):
     def start(self):
         if self._running:
             return
+        self._enforce_gates()          # A3: 比赛模式 + fail 级门禁 -> 抛异常拒绝启动 (无锁放行)
         cfg = dict(self._cam_cfg)
         self._grabber = FrameGrabber(lambda: create_camera(cfg), stale_s=float(cfg.get("stale_s", 2.0)))
         self._grabber.on_open = lambda cam: apply_controls(cam, cfg)
@@ -226,23 +257,92 @@ class VisionService(VisionServiceBase):
         targets.sort(key=lambda t: -t.confidence)
         for i, t in enumerate(targets):
             t.target_id = i + 1
+        # ---- A2: 发送前越界拦截 —— 越界目标不进返回/发布/记录, 只在日志与 last_scan_rejects 留证
+        kept, rejects = self._filter_limits(targets)
+        if ann is not None and rejects:
+            self._mark_rejects(ann, rejects)
         with self._lock:
-            self._latest_targets = list(targets)
+            self._latest_targets = list(kept)
             self._latest_annotated = ann
-        self.last_scan = {"ok": True, "frames": len(frames), "targets": len(targets),
+        self.last_scan = {"ok": True, "frames": len(frames), "targets": len(kept),
+                          "limit_rejected": len(rejects),
                           "grab_ms": round((t1 - t0) * 1e3, 1), "detect_ms": round((t2 - t1) * 1e3, 1),
                           "rejected": dict(getattr(self.detector, "rejected", {}) or {}),
                           "color_conflicts": n_conf,
                           "time": time.time()}
         logger.info("scan: %d 帧 -> %d 件 (取图 %.0f ms, 识别 %.0f ms) %s",
-                    len(frames), len(targets), (t1 - t0) * 1e3, (t2 - t1) * 1e3,
+                    len(frames), len(kept), (t1 - t0) * 1e3, (t2 - t1) * 1e3,
                     self.last_scan["rejected"] or "")
         try:
-            self.bus.publish(TOPIC_VISION_TARGET, list(targets), sender="vision")
+            self.bus.publish(TOPIC_VISION_TARGET, list(kept), sender="vision")
         except Exception:
             pass
-        self._enqueue_record(ref, ann, targets)
-        return targets, ref
+        self._enqueue_record(ref, ann, kept)
+        return kept, ref
+
+    # ================================================================== A2 发送前越界拦截
+    def _filter_limits(self, targets: List[VisionTarget]):
+        """
+        逐目标调用 limits.check_target (与网页「点哪去哪」/ `/comm` MOVE 同一个检查函数),
+        越界目标从返回序列里剔除并写 WARNING 事件 (像素/托盘/机械臂三套坐标)。
+
+        文字刻意与 UI 的"空盘"路径 (托盘无可识别货物, 抖料后重扫) 区分开, 否则
+        "全部越界" 会被上层误判成空盘。未配置 robot_limits_mm 时不拦截 (与基线一致)。
+
+        返回 (kept, rejects): rejects = [(target, LimitVerdict), ...]
+        """
+        self.last_scan_rejects = []
+        kept: List[VisionTarget] = []
+        rejects = []
+        for t in targets:
+            try:
+                v = self.calibrator.check_target(t)
+            except Exception:
+                logger.exception("限位检查异常, 目标按放行处理 (不影响识别)")
+                v = None
+            diag = getattr(t, "diagnostics", None)
+            if not isinstance(diag, dict):
+                diag = None
+            if v is not None and not v.ok:
+                rejects.append((t, v))
+                logger.warning("%s", _limits().format_reject(t, v))
+                rec = {"target_id": int(getattr(t, "target_id", 0) or 0),
+                       "label": t.label or t.class_name, "u": round(t.u_pixel, 1), "v": round(t.v_pixel, 1),
+                       "x_mm": round(t.x_mm, 2), "y_mm": round(t.y_mm, 2),
+                       "trigger": v.trigger, "axes": list(v.axes), "reason": v.reason}
+                rec.update({k: v.detail.get(k) for k in
+                            ("tray_xy", "tray_limits_mm", "robot_limits_mm", "tray_margin_mm")})
+                self.last_scan_rejects.append(rec)
+                if diag is not None:
+                    diag.update({"limit_checked": True, "limit_ok": False,
+                                 "limit_trigger": v.trigger, "limit_axes": list(v.axes),
+                                 "limit_reason": v.reason})
+                continue
+            if v is not None:
+                for w in v.warnings:
+                    logger.warning("%s: %s", "视觉限位提示", w)
+            if diag is not None:
+                # 与 A1 的颜色诊断合并, 不覆盖 (diagnostics 是 dict)
+                diag.update({"limit_checked": True, "limit_ok": True,
+                             "limit_configured": bool(v.detail.get("robot_limits_configured")) if v else False,
+                             "limit_trigger": "", "limit_axes": []})
+            kept.append(t)
+        if rejects and not kept:
+            logger.warning("%s", _limits().format_rejected_all(len(rejects), self.last_scan_rejects))
+        return kept, rejects
+
+    def _mark_rejects(self, ann: np.ndarray, rejects) -> None:
+        """调试台画面上把被拦目标标红 (只改展示用的标注图, 不影响识别结果)。"""
+        try:
+            for t, _v in rejects:
+                bb = tuple(getattr(t, "bbox", ()) or ())
+                if len(bb) == 4:
+                    x1, y1, x2, y2 = [int(round(float(c))) for c in bb]
+                    cv2.rectangle(ann, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                    cv2.putText(ann, "LIMIT", (x1, max(12, y1 - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        except Exception:
+            logger.exception("标注被拦目标异常 (不影响 scan)")
 
     # ================================================================== A1 颜色仲裁
     def _arbitrate_colors(self, targets: List[VisionTarget]) -> int:
@@ -297,6 +397,44 @@ class VisionService(VisionServiceBase):
         """按 color_names 的中文色名 + shape 重算显示名 (与 _build_target 的规则一致)。"""
         cn = getattr(self.detector, "color_cn", {}) or {}
         return str(cn.get(color, color)) + str(t.shape or "")
+
+    # ================================================================== A3 门禁
+    def gate_report(self):
+        """
+        A3 只读接口: 当前配置的 11 项门禁 (级别 = race_mode() 决定缺省 + calib_config.json
+        的 gates 显式覆盖 + IS_GATE_<ID> 环境变量)。不修改任何状态。
+        """
+        from . import gates as gatesmod
+        race = race_mode()
+        ctx = gatesmod.build_context(service=self, race=race)
+        return gatesmod.evaluate(ctx, race=race, gates_cfg=self.calibrator.gates_cfg)
+
+    def _enforce_gates(self) -> Optional[Any]:
+        """
+        A3: 比赛模式 (锁文件存在, config.race_mode()) 且有 fail 级门禁 -> logger.error 打印
+        全部失败项并抛异常, 让调用进程以非零退出码结束; 无锁 (调试) 只提示, 放行。
+        门禁本身不判"是不是比赛" —— 唯一判据就是锁文件, 见 vision/config.py。
+        """
+        try:
+            rep = self.gate_report()
+        except Exception:
+            logger.exception("视觉门禁检查异常 (按放行处理, 不因门禁自身故障拒绝启动)")
+            return None
+        if rep.ok:
+            for ln in rep.lines():
+                logger.info("%s", ln)
+            return rep
+        for ln in rep.lines():
+            logger.warning("%s", ln)
+        if not rep.race:
+            logger.warning("调试模式 (无锁文件 %s): 上面这些门禁项只提示, 不阻止启动",
+                           competition_lock_path())
+            return rep
+        msg = ("比赛模式 (存在锁文件 %s) 视觉门禁不通过, 拒绝启动:\n  " % competition_lock_path()
+               + "\n  ".join(it.line() for it in rep.fails)
+               + "\n请先处理上面各项 (现场标定/成像锁定/限位配置), 或删掉锁文件按调试模式启动。")
+        logger.error("%s", msg)
+        raise RuntimeError(msg)
 
     # ================================================================== 自检
     def self_check(self, log: bool = True) -> Dict[str, Any]:
@@ -379,6 +517,29 @@ class VisionService(VisionServiceBase):
                     "四角与参考点可能对不上。建议: 调试台 → 畸变页 →「一键校正」"
                     "(打印 tools/calib_board_A4.pdf 平铺在托盘上拍一张; 没有打印机可用托盘页的直边估计)")
         rep["roi"] = bool(getattr(self.detector, "roi", None) is not None)
+        # ---- A2: 限位未配置提示 (WARN 级: 只进 problems 列表, 不改任何退出码) ----
+        for note in cal.limit_notes():
+            if note not in rep["problems"]:
+                rep["problems"].append(note)
+        # ---- A3: 门禁并入 problems (每项含当前值与建议; 缺省级别随 race_mode() 变化) ----
+        try:
+            from . import gates as gatesmod
+            gr = self.gate_report()
+            rep["gates"] = {"race": bool(gr.race), "ok": bool(gr.ok),
+                            "fails": [it.id for it in gr.fails], "warns": [it.id for it in gr.warns],
+                            "thresholds": gr.thresholds,
+                            "items": [it.as_dict() if hasattr(it, "as_dict") else dict(it.__dict__)
+                                      for it in gr.items]}
+            for it in gr.items:
+                if it.level not in ("warn", "fail"):
+                    continue
+                if it.id == "robot_limits" and cal.robot_limits_mm is None:
+                    continue                    # 已由上面的限位提示覆盖, 不重复报
+                line = "%s: %s" % (gatesmod.GATE_LABEL.get(it.id, it.id), it.text)
+                if line not in rep["problems"]:
+                    rep["problems"].append(line)
+        except Exception:
+            logger.exception("门禁并入自检失败 (自检其余部分照旧)")
         rep["problems"] += self.warnings
         ev_t, ev = self._tray_event
         if ev and time.time() - ev_t < self.TRAY_EVENT_HOLD_S:

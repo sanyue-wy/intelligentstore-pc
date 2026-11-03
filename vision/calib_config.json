@@ -3,20 +3,20 @@
     "fixed_px": {
       "corners": [
         [
-          163.48,
-          129.54
+          74.5999984741211,
+          87.0999984741211
         ],
         [
-          455.22,
-          115.68
+          403.70001220703125,
+          6.900000095367432
         ],
         [
-          591.28,
-          352.19
+          629.4000244140625,
+          243.39999389648438
         ],
         [
-          83.26,
-          417.61
+          65.4000015258789,
+          411.8999938964844
         ]
       ],
       "image_size": [
@@ -34,16 +34,56 @@
       "tray_y",
       "-tray_x"
     ],
-    "ref_points": [],
+    "ref_points": [
+      {
+        "tray_mm": [
+          0,
+          0
+        ],
+        "robot_mm": [
+          0,
+          190
+        ],
+        "src": "manual"
+      },
+      {
+        "tray_mm": [
+          160,
+          0
+        ],
+        "robot_mm": [
+          0,
+          37
+        ],
+        "src": "manual"
+      },
+      {
+        "tray_mm": [
+          0,
+          160
+        ],
+        "robot_mm": [
+          160,
+          190
+        ],
+        "src": "manual"
+      }
+    ],
     "origin_mm": [
       0.0,
       190.0
     ],
-    "focal_px": 444.0
+    "focal_px": 444.0,
+    "perspective": "auto"
   },
   "image_size": [
     640,
     480
   ],
-  "cam_height_mm": 148.0
+  "cam_height_mm": 148.0,
+  "robot_limits_mm": null,
+  "tray_margin_mm": null,
+  "tray_margin_action": "warn",
+  "gates": {},
+  "gate_thresholds": {}
 }
