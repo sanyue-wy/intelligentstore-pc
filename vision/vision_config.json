@@ -67,7 +67,7 @@
   },
   "color": {
     "source": "hsv",
-    "tray_white_balance": false,
+    "tray_white_balance": true,
     "wb_gain_min": 0.7,
     "wb_gain_max": 1.4,
     "wb_min_pixels": 200,
