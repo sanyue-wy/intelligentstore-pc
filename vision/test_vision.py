@@ -1141,5 +1141,221 @@ class TestMultiFrameMatch(unittest.TestCase):
 
 
 
+class TestTrayWhiteBalance(unittest.TestCase):
+    """A6: 托盘白基准归一化 (默认关)。
+
+    取样 = 托盘内框 (这里用 detect.roi) 内 & 低饱和 & 高亮度 & **不在任何检测框内**;
+    增益 = 白斑三通道均值 / 各通道均值 (把偏色的"白"拉回中性), 限幅
+    [color.wb_gain_min, color.wb_gain_max]; 像素不足 wb_min_pixels -> 沿用上次增益;
+    关掉 -> 与 A5 行为逐字段一致。增益只乘在「颜色投票前的裁剪图」上, 送模型/精定位的帧不变。
+    """
+
+    SHAPE = "hemisphere"
+    NAMES = ["红色半球"]
+    BOX = (100, 100, 200, 200)          # 物体框 (白基准取样要排除它)
+    ROI = [[0, 0], [640, 0], [640, 480], [0, 480]]
+    WHITE = (220, 205, 190)             # BGR: 托盘"白"偏蓝
+    OBJ = (185, 170, 150)               # BGR: 物体像素 (偏蓝, 未归一化判成蓝)
+    HSV = {"black_v_max": 60, "white_s_max": 45, "white_v_min": 150,
+           "hue_bins": [["blue", 100, 130]]}
+    EXPECT_GAIN = [0.932, 1.0, 1.079]   # B=220 G=205 R=190 -> 目标亮度 205
+    BLUE = ("blue", "light_blue")
+
+    class _StubEngine:
+        def __init__(self, names):
+            self.class_names = list(names)
+            self.is_ready = True
+            self.last_error = ""
+
+        def describe(self):
+            return "stub-wb-engine"
+
+    def _frame(self):
+        f = np.zeros((480, 640, 3), np.uint8)
+        f[:, :] = self.WHITE
+        f[self.BOX[1]:self.BOX[3], self.BOX[0]:self.BOX[2]] = self.OBJ
+        return f
+
+    def _files(self, prefix, color=None, hsv=None, roi=None, replay=False):
+        """tmp classes.json + vision_config.json + 无托盘的 calib.json (不碰现场标定)。"""
+        import json
+        import os
+        import shutil
+        import tempfile
+        from vision.config import load_vision_config
+
+        tmp = tempfile.mkdtemp(prefix=prefix)
+        self.addCleanup(shutil.rmtree, tmp, True)
+        meta_path = os.path.join(tmp, "classes.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump({"color_names": {"red": "红色", "blue": "蓝色", "white": "白色"},
+                       "hsv": dict(hsv or self.HSV),
+                       "classes": [{"id": 0, "name": self.NAMES[0], "shape_cn": self.SHAPE,
+                                    "color": None, "model_color": "red", "height_mm": 30}]},
+                      f, ensure_ascii=False, indent=2)
+        cfgd = {"record": {"enabled": False},
+                "detect": {"roi": self.ROI if roi is None else roi},
+                "color": dict(color or {})}
+        if replay:
+            cfgd["camera"] = {"type": "replay", "path": tmp, "fps": 60, "loop": True, "stale_s": 5.0}
+        cfg_path = os.path.join(tmp, "vision_config.json")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfgd, f, ensure_ascii=False, indent=2)
+        # 标定: 用仓库现场标定为底, 只把托盘模式关掉 (本测试要自己控 ROI, 也要确定性)
+        calib_path = os.path.join(tmp, "calib.json")
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "calib_config.json"), encoding="utf-8") as f:
+            calib = json.load(f)
+        calib["tray"] = {"enabled": False}
+        with open(calib_path, "w", encoding="utf-8") as f:
+            json.dump(calib, f, ensure_ascii=False)
+        return tmp, meta_path, load_vision_config(cfg_path), calib_path
+
+    def _det(self, color=None, hsv=None, roi=None):
+        """直接构造 detector (桩引擎, 不启 service): 测 _update_tray_wb/_vote_color/wb_info。"""
+        from vision.yolo_detector import YoloWorkpieceDetector
+
+        _tmp, meta_path, cfg, calib_path = self._files("a6_wb_", color=color, hsv=hsv, roi=roi)
+        return YoloWorkpieceDetector(CoordinateCalibrator(config_path=calib_path),
+                                     engine=self._StubEngine(self.NAMES),
+                                     meta_path=meta_path, config=cfg)
+
+    def _service(self, color=None):
+        """端到端: replay 相机 + 真 detector, 只覆盖 _infer 注入 Detection。"""
+        import cv2
+        import os
+        from vision.interfaces import Detection
+        from vision.yolo_detector import YoloWorkpieceDetector
+
+        tmp, meta_path, cfg, calib_path = self._files("a6_wb_svc_", color=color, replay=True)
+        cv2.imwrite(os.path.join(tmp, "frame.png"), self._frame())
+        det = YoloWorkpieceDetector(CoordinateCalibrator(config_path=calib_path),
+                                    engine=self._StubEngine(self.NAMES),
+                                    meta_path=meta_path, config=cfg)
+        svc = VisionService(MessageBus(), detector_factory=lambda cal: det,
+                            continuous_detect=False, config=cfg)
+        svc.start()
+        self.addCleanup(svc.stop)
+        det._infer = lambda frame: [Detection(0, self.NAMES[0], 0.9, *self.BOX)]
+        return svc, det
+
+    @staticmethod
+    def _json(ts):
+        import json
+
+        return json.dumps([{"label": t.label, "category": t.category, "color": t.color,
+                            "shape": t.shape, "conf": t.confidence, "u": t.u_pixel,
+                            "v": t.v_pixel, "x_mm": t.x_mm, "y_mm": t.y_mm,
+                            "class": t.class_name, "info": t.info, "hits": t.hits,
+                            "angle": t.angle_deg, "bbox": list(t.bbox)} for t in ts],
+                          ensure_ascii=False, sort_keys=True, default=str)
+
+    # ---------------------------------------------------------------- 关闭 = 零影响
+    def test_disabled_is_identical_to_baseline(self):
+        """无 color 段 (A5 行为) 与显式 tray_white_balance=false 的 scan() 输出逐字段相同。"""
+        svc_a, _det_a = self._service(color=None)
+        svc_b, _det_b = self._service(color={"tray_white_balance": False})
+        ts_a = svc_a.scan(n_frames=2, skip_frames=0)[0]
+        ts_b = svc_b.scan(n_frames=2, skip_frames=0)[0]
+        self.assertTrue(ts_a and ts_b)
+        self.assertEqual(self._json(ts_a), self._json(ts_b))
+        for t in list(ts_a) + list(ts_b):
+            self.assertNotIn("wb_reason", t.diagnostics)
+            self.assertNotIn("wb_gain", t.diagnostics)
+
+    def test_enabled_normalises_only_the_colour_vote(self):
+        """打开后: 颜色由蓝变白 (category 第二段跟着变), 但送模型的帧逐像素不变。"""
+        svc, det = self._service(color={"tray_white_balance": True})
+        seen = []
+        inner = det._infer
+        det._infer = lambda frame: (seen.append(np.array(frame, copy=True)), inner(frame))[1]
+        ts = svc.scan(n_frames=2, skip_frames=0)[0]
+        self.assertTrue(ts)
+        self.assertEqual(ts[0].color, "white")
+        self.assertEqual(ts[0].category, "%s|white|" % self.SHAPE)
+        self.assertEqual(ts[0].diagnostics.get("wb_reason"), "ok")
+        self.assertGreater(ts[0].diagnostics.get("wb_pixels", 0), 200)
+        self.assertTrue(seen)
+        for f in seen:
+            self.assertTrue(np.array_equal(f, self._frame()))
+
+    # ---------------------------------------------------------------- 增益计算
+    def test_gain_from_tray_white_patch(self):
+        det = self._det(color={"tray_white_balance": True})
+        f = self._frame()
+        det._update_tray_wb(f, [self.BOX])
+        info = det.wb_info()
+        self.assertEqual(info["reason"], "ok")
+        self.assertGreater(info["pixels"], det.wb_min_pixels)
+        for got, exp in zip(info["gain"], self.EXPECT_GAIN):
+            self.assertAlmostEqual(got, exp, places=2)
+        self.assertEqual(info["means"], [220.0, 205.0, 190.0])
+        det2 = self._det()                       # 关着: 不取样、不写增益
+        det2._update_tray_wb(f, [self.BOX])
+        self.assertEqual(det2.wb_info()["reason"], "disabled")
+        self.assertIsNone(det2.wb_info()["gain"])
+
+    def test_vote_flips_only_when_enabled(self):
+        det = self._det(color={"tray_white_balance": True})
+        f = self._frame()
+        self.assertIn(det._vote_color(f, self.BOX[0], self.BOX[1], self.BOX[2], self.BOX[3], None),
+                      self.BLUE)             # 未归一化: 偏色的"白"被算成蓝
+        det._update_tray_wb(f, [self.BOX])
+        self.assertEqual(det._vote_color(f, self.BOX[0], self.BOX[1], self.BOX[2], self.BOX[3], None),
+                         "white")
+        self.assertTrue(np.array_equal(f, self._frame()))    # 原帧没被就地修改
+
+    def test_too_few_pixels_keeps_previous_gain(self):
+        det = self._det(color={"tray_white_balance": True})
+        f = self._frame()
+        det._update_tray_wb(f, [self.BOX])
+        first = list(det.wb_info()["gain"])
+        self.assertEqual(det.wb_info()["reason"], "ok")
+        det.wb_min_pixels = 10 ** 6
+        det._update_tray_wb(f, [self.BOX])
+        info = det.wb_info()
+        self.assertEqual(info["reason"], "too_few_pixels")
+        self.assertEqual(info["gain"], first)                # 沿用上次增益
+        self.assertEqual(det._vote_color(f, self.BOX[0], self.BOX[1], self.BOX[2], self.BOX[3], None),
+                         "white")
+
+    def test_missing_tray_region_skips(self):
+        det = self._det(color={"tray_white_balance": True}, roi=[])
+        det.calibrator = None                                # 既无托盘内框也无 ROI
+        f = self._frame()
+        det._update_tray_wb(f, [self.BOX])
+        info = det.wb_info()
+        self.assertEqual(info["reason"], "no_tray")
+        self.assertIsNone(info["gain"])
+        self.assertIn(det._vote_color(f, self.BOX[0], self.BOX[1], self.BOX[2], self.BOX[3], None),
+                      self.BLUE)
+
+    def test_gain_is_clamped_to_config_limits(self):
+        det = self._det(color={"tray_white_balance": True},
+                        hsv=dict(self.HSV, white_s_max=250, white_v_min=100))
+        f = np.zeros((480, 640, 3), np.uint8)
+        f[:, :] = (20, 200, 255)                             # 极端偏色: B 很暗 -> 增益要撞上限
+        f[self.BOX[1]:self.BOX[3], self.BOX[0]:self.BOX[2]] = self.OBJ
+        det._update_tray_wb(f, [self.BOX])
+        gain = det.wb_info()["gain"]
+        self.assertEqual(det.wb_info()["reason"], "ok")
+        self.assertAlmostEqual(gain[0], det.wb_gain_max, places=3)
+        self.assertAlmostEqual(gain[2], det.wb_gain_min, places=3)
+        for g in gain:
+            self.assertGreaterEqual(g, det.wb_gain_min)
+            self.assertLessEqual(g, det.wb_gain_max)
+
+    def test_gain_limits_are_validated_in_config(self):
+        _tmp, _meta, cfg, _calib = self._files("a6_wb_cfg_",
+                                               color={"wb_gain_min": 1.9, "wb_gain_max": 1.4})
+        self.assertTrue(any("wb_gain_min" in w for w in cfg.warnings))
+
+    def test_roi_is_used_when_no_tray(self):
+        det = self._det(color={"tray_white_balance": True})
+        self.assertIsNotNone(det._tray_region())             # detect.roi 兜底
+        det.set_roi([])
+        self.assertIsNone(det._tray_region())
+
+
 if __name__ == "__main__":
     unittest.main()

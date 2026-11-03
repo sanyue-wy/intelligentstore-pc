@@ -92,7 +92,16 @@ class YoloWorkpieceDetector(WorkpieceDetector):
         self._qr_used_ms = 0.0
         self._qr_exhausted = self.qr_budget_ms <= 0
         # A1 颜色来源: hsv(默认, HSV 投票为权威) | model(应急: 直接用类名颜色)
-        self.color_source = str((getattr(self.cfg, "color", {}) or {}).get("source", "hsv")).lower()
+        _col_cfg = getattr(self.cfg, "color", {}) or {}
+        self.color_source = str(_col_cfg.get("source", "hsv")).lower()
+        # A6 托盘白基准归一化 (默认关): 增益只作用于「颜色投票前的裁剪图」, 送模型的那张图不动
+        self.wb_enabled = bool(_col_cfg.get("tray_white_balance", False))
+        self.wb_gain_min = float(_col_cfg.get("wb_gain_min", 0.7) or 0.7)
+        self.wb_gain_max = float(_col_cfg.get("wb_gain_max", 1.4) or 1.4)
+        self.wb_min_pixels = int(float(_col_cfg.get("wb_min_pixels", 200) or 0))
+        self._wb_gain: Optional[np.ndarray] = None
+        self._wb_info: dict = {"reason": "disabled" if not self.wb_enabled else "not_run",
+                               "pixels": 0, "gain": None, "means": None}
         self.parallax_factor = float(det_cfg.get("parallax_factor", 0.6))
         self.min_area_px = float(det_cfg.get("min_area_px", 0) or 0)
         self.max_area_px = float(det_cfg.get("max_area_px", 0) or 0)
@@ -188,8 +197,11 @@ class YoloWorkpieceDetector(WorkpieceDetector):
         if not self._engine_ready():
             return self._hsv_fallback(bgr_frame)
         self._reset_qr_budget()
+        dets = self._infer(bgr_frame)
+        # A6: 单帧路径也按当前帧 + 检测框重算一次白基准增益
+        self._update_tray_wb(bgr_frame, [(d.x1, d.y1, d.x2, d.y2) for d in dets])
         return [self._build_target(bgr_frame, d, i + 1, refine=self.refine)
-                for i, d in enumerate(self._infer(bgr_frame))]
+                for i, d in enumerate(dets)]
 
     def detect_fast(self, bgr_frame: np.ndarray) -> List[VisionTarget]:
         """只推理不精定位 (实时预览用)。"""
@@ -231,8 +243,11 @@ class YoloWorkpieceDetector(WorkpieceDetector):
         min_hits = min_hits or max(1, int(np.ceil(n * min_hit_ratio)))
 
         tracks: List[dict] = []
+        boxes_by_frame: Dict[int, list] = {}
         for fi, f in enumerate(frames):
-            for d in self._infer(f):
+            dets_f = self._infer(f)
+            boxes_by_frame[fi] = [(d.x1, d.y1, d.x2, d.y2) for d in dets_f]
+            for d in dets_f:
                 # A5: 半径按本目标大小自适应 (不再是固定 25px)
                 radius = self._match_radius(d, match_px)
                 cands = []
@@ -259,6 +274,8 @@ class YoloWorkpieceDetector(WorkpieceDetector):
 
         ref_idx = n - 1
         ref = frames[ref_idx]
+        # A6: 每次 scan 用参考帧 + 该帧检测框重算一次白基准增益 (增益按整次 scan 用)
+        self._update_tray_wb(ref, boxes_by_frame.get(ref_idx, []))
         targets: List[VisionTarget] = []
         for t in tracks:
             hits = len(t["dets"])
@@ -386,6 +403,11 @@ class YoloWorkpieceDetector(WorkpieceDetector):
             tgt.diagnostics["template_set"] = template_set
         if info_missing:
             tgt.diagnostics["info_missing"] = True
+        if self.wb_enabled:
+            # A6: 白基准状态 (关闭时不写任何键 -> 关掉后 diagnostics 也逐字段不变)
+            tgt.diagnostics.update({"wb_reason": self._wb_info.get("reason"),
+                                    "wb_pixels": self._wb_info.get("pixels", 0),
+                                    "wb_gain": self._wb_info.get("gain")})
         return tgt
 
     def _refine(self, frame, x1, y1, x2, y2, fallback, thin: bool = False):
@@ -436,8 +458,100 @@ class YoloWorkpieceDetector(WorkpieceDetector):
             logger.debug("精定位退回框中心: %s", e)
             return fallback[0], fallback[1], 0.0, None
 
+    # ============================================================== A6 托盘白基准
+    def wb_info(self) -> dict:
+        """只读白基准状态 (调试台显示当前增益用; 不修改任何状态)。"""
+        g = getattr(self, "_wb_gain", None)
+        info = getattr(self, "_wb_info", {}) or {}
+        return {"enabled": bool(getattr(self, "wb_enabled", False)),
+                "gain": [round(float(x), 3) for x in g] if g is not None else None,
+                "gain_min": float(getattr(self, "wb_gain_min", 0.7)),
+                "gain_max": float(getattr(self, "wb_gain_max", 1.4)),
+                "min_pixels": int(getattr(self, "wb_min_pixels", 200)),
+                "reason": info.get("reason"),
+                "pixels": info.get("pixels", 0),
+                "means": info.get("means")}
+
+    def _tray_region(self) -> Optional[np.ndarray]:
+        """A6: 白基准取样区域 (Nx2 像素外轮廓)。取不到返回 None -> 跳过归一化。
+
+        优先托盘内框: (1) 自动检测的四角 ``calibrator.tray_tracker.stable``;
+        (2) 固定托盘 ``tray.fixed_px`` 四角; (3) 手动/自动 ROI (``detect.roi`` -> ``set_roi()``)。
+        """
+        cal = self.calibrator
+        if cal is not None:
+            st = getattr(getattr(cal, "tray_tracker", None), "stable", None)
+            if st is not None:
+                p = np.asarray(st, dtype=np.float32).reshape(-1, 2)
+                if len(p) >= 3:
+                    return p
+            try:
+                from . import tray as traymod
+                fx = traymod.fixed_corners_px(getattr(cal, "tray_cfg", None) or {})
+                if fx is not None:
+                    p = np.asarray(fx, dtype=np.float32).reshape(-1, 2)
+                    if len(p) >= 3:
+                        return p
+            except Exception:
+                logger.debug("托盘固定四角读取失败, 回退 ROI", exc_info=True)
+        if self.roi is not None and len(self.roi) >= 3:
+            return self.roi
+        return None
+
+    def _update_tray_wb(self, frame: np.ndarray, boxes) -> None:
+        """A6: 白斑法自算三通道增益 (每次 scan 一次; 自实现, 不用 scipy/新依赖)。
+
+        取样 = 托盘内框内 & 低饱和 (S <= hsv.white_s_max) & 高亮度 (V >= hsv.white_v_min)
+        & 不在任何检测框内; 增益 = 目标白亮度 (白斑三通道均值, 即把偏色的"白"拉回中性) /
+        该通道均值, 限幅 [wb_gain_min, wb_gain_max] 后缓存。纯中性白斑 -> 增益恒为 1.0。
+        像素不足 ``wb_min_pixels`` -> **沿用上次增益**。
+        只写 self._wb_gain, 不动任何图像; 应用点在 _vote_color 的裁剪图。
+        """
+        if not getattr(self, "wb_enabled", False) or frame is None or getattr(frame, "size", 0) == 0:
+            return
+        poly = self._tray_region()
+        if poly is None:
+            self._wb_info.update({"reason": "no_tray"})
+            logger.debug("托盘白基准: 拿不到托盘内框/ROI, 跳过归一化")
+            return
+        h, w = frame.shape[:2]
+        region = np.zeros((h, w), np.uint8)
+        cv2.fillPoly(region, [np.round(poly).astype(np.int32)], 1)
+        for (x1, y1, x2, y2) in (boxes or []):
+            pad = max(2, int(0.05 * max(float(x2) - float(x1), float(y2) - float(y1))))
+            cv2.rectangle(region, (int(x1) - pad, int(y1) - pad),
+                          (int(x2) + pad, int(y2) + pad), 0, -1)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        s_max = float(self.hsv_cfg.get("white_s_max", 45) or 45)
+        v_min = float(self.hsv_cfg.get("white_v_min", 150) or 150)
+        sel = (region > 0) & (hsv[:, :, 1] <= s_max) & (hsv[:, :, 2] >= v_min)
+        n = int(np.count_nonzero(sel))
+        if n < int(getattr(self, "wb_min_pixels", 200)):
+            self._wb_info.update({"reason": "too_few_pixels", "pixels": n})
+            logger.debug("托盘白基准像素不足 (%d < %d), 沿用上次增益", n, self.wb_min_pixels)
+            return
+        means = [float(frame[:, :, i][sel].mean()) for i in range(3)]        # B G R
+        target = float(np.mean(means)) or 1.0
+        gain = np.array([min(self.wb_gain_max, max(self.wb_gain_min, target / (m or 1.0)))
+                         for m in means], dtype=np.float32)
+        self._wb_gain = gain
+        self._wb_info.update({"reason": "ok", "pixels": n,
+                              "means": [round(m, 1) for m in means],
+                              "gain": [round(float(g), 3) for g in gain],
+                              "target": round(target, 1)})
+        logger.info("托盘白基准增益 BGR=%s (白斑 %d px)", [round(float(g), 3) for g in gain], n)
+
+    def _apply_wb(self, crop: np.ndarray) -> np.ndarray:
+        """A6: 把缓存增益乘到颜色投票用的裁剪图上 (不改原帧)。"""
+        gain = getattr(self, "_wb_gain", None)
+        if not getattr(self, "wb_enabled", False) or gain is None or crop.size == 0:
+            return crop
+        out = crop.astype(np.float32) * gain.reshape(1, 1, 3)
+        return np.clip(out, 0.0, 255.0).astype(np.uint8)
+
     def _vote_color(self, frame, x1, y1, x2, y2, mask, thin: bool = False) -> str:
-        roi = frame[y1:y2, x1:x2]
+        # A6: 白基准增益只作用在这张「颜色投票用的裁剪图」上; 送模型/精定位用的仍是原图
+        roi = self._apply_wb(frame[y1:y2, x1:x2])
         if roi.size == 0:
             return "unknown"
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)

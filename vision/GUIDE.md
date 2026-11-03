@@ -164,6 +164,15 @@ DFOV 规格也能反算（`f = 对角像素/2 / tan(DFOV/2)`，100° 时 f@1920=
 - `min_hits` 语义不变（`ceil(帧数 × min_hit_ratio)`）；`service.scan()` 仍会传 `match_px`，只在 `scan.match_ratio <= 0` 时作为旧参数兜底生效。
 - `IS_MATCH_RATIO` / `IS_MATCH_PX_MIN` 可临时覆盖。
 
+### 7.4 托盘白基准归一化（A6，默认关）
+- **开关**：`color.tray_white_balance`（默认 `false`）；`IS_TRAY_WB=1` 可临时打开。调试台「颜色」页有对比勾选框（`仅本次` / `应用并保存`），旁边直接显示当前增益、白斑像素数与取样原因。
+- **取样**：每次 scan 从**托盘内框**（自动检测四角 → `tray.fixed_px` → 手动/自动 `detect.roi`，都取不到就跳过）里挑「低饱和 `S <= hsv.white_s_max` + 高亮度 `V >= hsv.white_v_min` + **不在任何检测框内**」的像素（自实现白斑法，不引入 scipy/新依赖）。
+- **增益**：目标白亮度 = 白斑三通道均值，增益 = 目标 / 各通道均值，限幅 `color.wb_gain_min`(0.7) ~ `color.wb_gain_max`(1.4) 后缓存；白斑像素少于 `color.wb_min_pixels`(200) 时**沿用上次增益**，一只都没有就跳过。
+- **作用范围**：增益**只乘在颜色投票前的裁剪图**上；送模型的那张图、GrabCut 精定位用的原图都不动（单测逐像素断言）。所以它只影响 `color` 与 `category` 第二段。
+- **关掉 = 零影响**：`tray_white_balance=false` 时不取样、不写 `diagnostics`，`scan()` 输出与 A5 逐字段一致（单测有 JSON diff 断言）。
+- **什么时候打开**：现场照明明显偏色（例如白托盘在画面里发蓝/发黄）导致颜色投票系统性误判时才开；打开后要在同一光照/曝光下对比「颜色」页与 Scan 结果的 `color`/`category`，确认是纠正而不是把别的颜色拉偏。
+- **`[现场待验证]`**：0.7~1.4 的限幅、`wb_min_pixels=200`、以及"白斑三通道均值"这个目标亮度都是经验值，现场必须实测确认；现场光照稳定后更推荐直接锁 `camera.exposure_us/gain_db/wb_kelvin`（见 A3 门禁 `imaging_locked`）而不是依赖本功能。
+
 ## 8. 换模型 / 换相机 / 复现
 - 换模型：`.pt` 放进 `vision/models/` → `./convert.sh`（`tools/GUIDE.md`）。
 - 换工业相机：`"camera": {"type": "hikrobot", ...}`；其它品牌实现 `VisionCamera` 并 `register_camera()`。

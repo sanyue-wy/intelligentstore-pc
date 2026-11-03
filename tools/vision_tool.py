@@ -302,7 +302,9 @@ input[type=range]{width:220px}#msg{color:#fb3;min-height:18px}.thumb{width:160px
 <div class="dim">颜色冲突处理 (Scan 表格里「颜色冲突」列, 画面里洋红框 + 「冲突」字样): <b>按 HSV</b> = 接受 HSV 判定 (本类本次会话生效);
 <b>去颜色页重新采样</b> = 跳本页并预选该类名色, 重新点几处「生成颜色区间」; <b>本类强制颜色</b> = 把 HSV 判定的颜色写进 classes.json 该类的 color (唯一写 color 的路径, 写前备份), 之后该类不再投票。详见 vision/GUIDE.md。</div></p>
  <select id="cname"><option>red</option><option>orange</option><option>yellow</option><option>green</option><option>light_blue</option><option>blue</option><option>purple</option><option>white</option><option>black</option><option>gray</option></select>
- <label><input type="checkbox" id="colmode"> 采样模式</label> <button onclick="colsolve()">生成颜色区间</button><button onclick="colclear()">清空</button><pre id="cols"></pre></div>
+ <label><input type="checkbox" id="colmode"> 采样模式</label> <button onclick="colsolve()">生成颜色区间</button><button onclick="colclear()">清空</button><pre id="cols"></pre>
+ <div class="dim">托盘白基准归一化 (A6, <b>默认关</b>, <b>[现场待验证]</b>): 每次 scan 从托盘内框取「低饱和 + 高亮度 + 不在检测框内」的像素, 自算 BGR 三通道增益 (限幅 0.7~1.4), <b>只用于颜色投票前的裁剪图</b>, 送模型的那张图不动。现场光线偏色导致颜色误判时才打开; 取样像素不足 (&lt; wb_min_pixels) 就沿用上次增益; 关掉后与旧行为完全一致。</div>
+ <label><input type="checkbox" id="wbmode"> 托盘白基准</label> <button onclick="wbset(false)">仅本次</button><button onclick="wbset(true)">应用并保存</button><pre id="wb"></pre></div>
 <div class="pane" id="p_scr"><p>按最近一次 Scan 置信度最高的货物渲染, 与比赛大屏完全相同。</p><img id="scrimg" style="width:100%"></div>
 <div class="pane" id="p_run"><div id="runs"></div><div id="rundetail"></div></div>
 </div>
@@ -312,7 +314,7 @@ const $=id=>document.getElementById(id);
 async function J(u,o){let r=await fetch(u,o);return r.json()}
 function post(u,b){return J(u,{method:'POST',body:JSON.stringify(b||{})})}
 function tab(t){for(let k of ['st','cal','tray','dist','cam','col','scr','run']){$('p_'+k).className='pane'+(k==t?' on':'');$('t_'+k).className=k==t?'on':''}
- if(t=='cam')camget();if(t=='scr')$('scrimg').src='/screen.png?'+Date.now();if(t=='run')runs();if(t=='col')collist();if(t=='tray')trget();if(t=='dist')chget()}
+ if(t=='cam')camget();if(t=='scr')$('scrimg').src='/screen.png?'+Date.now();if(t=='run')runs();if(t=='col'){collist();wbget()}if(t=='tray')trget();if(t=='dist')chget()}
 let TR={};
 async function trget(){let d=await J('/api/tray');TR=d.cfg;$('tr_en').checked=!!d.cfg.enabled;$('tr_roi').checked=d.cfg.auto_roi!==false;
  $('tr_w').value=d.cfg.inner_w_mm||'';$('tr_h').value=d.cfg.inner_h_mm||'';$('tr_rim').value=d.cfg.rim_mm||0;$('tr_rh').value=d.cfg.rim_height_mm||0;$('tr_ch').value=d.cam_height_mm||0;
@@ -380,6 +382,8 @@ async function camset(save){let d=await post('/api/camera',{exposure_us:+$('exp'
 async function collist(){let d=await J('/api/color/list');$('cols').innerText=d.samples.map(s=>`${s.color}: H${s.h} S${s.s} V${s.v}`).join('\n')||'(无采样)'}
 async function colsolve(){let d=await post('/api/color/solve');$('cols').innerText=JSON.stringify(d,null,1)}
 async function colclear(){await post('/api/color/clear');collist()}
+async function wbget(){let d=await J('/api/wb');$('wbmode').checked=!!d.enabled;$('wb').innerText='enabled='+!!d.enabled+'  gain='+JSON.stringify(d.gain)+'  reason='+d.reason+'  pixels='+d.pixels+'  限幅='+d.gain_min+'~'+d.gain_max+(d.means?'  白斑均值='+JSON.stringify(d.means):'')}
+async function wbset(save){let d=await post('/api/wb',{enabled:$('wbmode').checked,save});$('wb').innerText=JSON.stringify(d,null,1);wbget()}
 async function runs(){let d=await J('/api/runs');$('runs').innerHTML='<table><tr><th>时间</th><th>结果</th><th>件数</th><th>用时</th><th>告警</th></tr>'+
  d.runs.map(r=>`<tr onclick="run('${r.id}')" style="cursor:pointer"><td>${r.start}</td><td>${r.result}</td><td>${r.total_done}</td><td>${r.elapsed_s}s</td><td>${r.warnings}</td></tr>`).join('')+'</table>'}
 async function run(id){let r=await J('/api/run?id='+id);let h=`<h4>${id} ${r.result} ${r.total_done} 件 ${r.elapsed_s}s</h4>`+(r.warnings||[]).map(w=>`<div class=bad>${w}</div>`).join('');
@@ -492,6 +496,42 @@ def cmd_web(args):
             return {"ok": True, "target": [round(x, 1), round(y, 1)], "reached": list(pos), "err_mm": err}
         finally:
             arm["lock"].release()
+
+    def wb_get():
+        """A6: 托盘白基准状态 (只读; 调试台显示当前增益与取样情况)。"""
+        det = getattr(svc, "detector", None)
+        info = det.wb_info() if hasattr(det, "wb_info") else {}
+        out = dict(info)
+        out["saved"] = bool((svc.cfg.color or {}).get("tray_white_balance", False))
+        out["tip"] = ("[现场待验证] 默认关; 只在现场光线偏色导致颜色误判时才打开, "
+                      "并在同一光照/曝光下对比 Scan 结果")
+        return out
+
+    def wb_set(body):
+        """A6: 托盘白基准对比开关 (可开/关)。enabled 对本次会话立即生效;
+        save=true 时把 color.tray_white_balance 写回 vision_config.json。"""
+        col = svc.cfg.color
+        if body.get("enabled") is not None:
+            col["tray_white_balance"] = bool(body.get("enabled"))
+        det = getattr(svc, "detector", None)
+        if det is not None and hasattr(det, "wb_enabled"):
+            det.wb_enabled = bool(col.get("tray_white_balance", False))
+            if not det.wb_enabled:                 # 关掉后别再用旧增益
+                det._wb_gain = None
+                det._wb_info["reason"] = "disabled"
+                det._wb_info["gain"] = None
+        saved = ""
+        if body.get("save"):
+            from vision.config import DEFAULT_CONFIG_PATH
+            path = os.environ.get("IS_VISION_CONFIG") or DEFAULT_CONFIG_PATH
+            data = _load_json(path, {})
+            data.setdefault("color", {})["tray_white_balance"] = bool(col.get("tray_white_balance", False))
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            saved = path
+        out = wb_get()
+        out["saved"] = saved or out["saved"]
+        return out
 
     def camera_get():
         cfg = svc._cam_cfg
@@ -948,6 +988,8 @@ def cmd_web(args):
                 self._json({"points": calib_pts})
             elif u.path == "/api/camera":
                 self._json(camera_get())
+            elif u.path == "/api/wb":
+                self._json(wb_get())
             elif u.path == "/api/tray":
                 self._json(tray_get())
             elif u.path == "/calib_board.pdf":
@@ -1035,6 +1077,8 @@ def cmd_web(args):
                 self._json(goto(b.get("u", 0), b.get("v", 0), b.get("h", 0)))
             elif u == "/api/camera":
                 self._json(camera_set(self._body()))
+            elif u == "/api/wb":
+                self._json(wb_set(self._body()))
             elif u == "/api/color/add":
                 from vision.color_calib import sample_hsv
                 b = self._body()

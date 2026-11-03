@@ -210,6 +210,9 @@ def load_vision_config(path: Optional[str] = None) -> VisionConfig:
     if col.get("source") not in ("hsv", "model"):
         warnings.append(f"color.source={col.get('source')!r} 无效 (只能是 hsv|model), 改为 hsv")
         col["source"] = "hsv"
+    if float(col.get("wb_gain_min", 0.7) or 0) > float(col.get("wb_gain_max", 1.4) or 0):
+        warnings.append(f"color.wb_gain_min ({col.get('wb_gain_min')}) > color.wb_gain_max "
+                        f"({col.get('wb_gain_max')}): 托盘白基准增益限幅写反了, 归一化不会生效")
     if float(det.get("qr_budget_ms", 500) or 0) < 0:
         warnings.append("detect.qr_budget_ms 不能为负, 改为 0 (本次 scan 不解码)")
         det["qr_budget_ms"] = 0
